@@ -1,0 +1,7 @@
+/target
+/target-host-*
+/dist
+/validation
+/.agy-staff
+*.pdb
+**/*.rs.bk

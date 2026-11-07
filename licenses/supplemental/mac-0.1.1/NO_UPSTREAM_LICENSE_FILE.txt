@@ -1,0 +1,8 @@
+﻿Crate: mac v0.1.1
+Repository: https://github.com/reem/rust-mac
+Source Commit/Ref: master (author: Jonathan Reem)
+License: MIT/Apache-2.0
+Upstream Status: [上游无独立文件] 该仓库根目录未包含独立的 LICENSE 文本文件。
+README 声明:
+  "Jonathan Reem is the primary author and maintainer of mac.
+   License: MIT/Apache-2.0, like rust itself"

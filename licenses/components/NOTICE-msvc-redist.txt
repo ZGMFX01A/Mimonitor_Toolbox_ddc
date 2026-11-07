@@ -1,0 +1,18 @@
+================================================================================
+  Microsoft Visual C++ Runtime 可再分发组件声明 (MSVC Redistributable Code)
+================================================================================
+
+【组件名称】: Microsoft Visual C++ 2015-2022 Runtime (x64) - vcruntime140.dll
+【版权所有】: Copyright (C) Microsoft Corporation. All rights reserved.
+【许可条款】: Microsoft Visual Studio Software License Terms (Distributable Code)
+【分发方式】: 应用程序本地部署 (App-Local Deployment)
+【包含路径】:
+  - 便携包根目录: Mimonitor_Toolbox_ddc-portable/vcruntime140.dll
+  - ADB 运行时目录: Mimonitor_Toolbox_ddc-portable/assets/runtime/vcruntime140.dll
+
+【许可与分发说明】:
+1. 本便携包内随附的 vcruntime140.dll 来自 Microsoft Visual Studio / Visual Studio Build Tools 官方安装目录下的可再分发 CRT 库 (VC\Redist\MSVC\*\x64\Microsoft.VC*.CRT\)。
+2. 本组件依据 Microsoft Visual Studio 软件许可条款中的“可再分发代码”(Distributable Code) 规定随本软件进行 App-Local 形式分发，旨在确保程序在未预装 Visual C++ Redistributable 的干净 Windows 10/11 操作系统上能够自足免安装运行。
+3. 严格声明：本组件为微软专有软件 (Proprietary Software) 的官方可再分发二进制库，受微软软件许可条款保护，绝非 MIT、Apache 或任何开源软件，严禁虚构其开源协议或版权所有者。
+4. 有关微软可再分发代码的最新清单与条款，请参阅随附的 licenses/components/Redist.txt 以及微软官方说明：
+   https://aka.ms/vs/18/redistribution

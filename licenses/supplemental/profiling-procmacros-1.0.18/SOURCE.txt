@@ -1,0 +1,7 @@
+﻿Crate: profiling-procmacros-1.0.18
+Workspace: https://github.com/aclysma/profiling
+Source URLs:
+  - https://raw.githubusercontent.com/aclysma/profiling/master/LICENSE-MIT
+  - https://raw.githubusercontent.com/aclysma/profiling/master/LICENSE-APACHE
+License: MIT OR Apache-2.0
+Copyright: Copyright (c) 2020 Philip Degarmo and other contributors

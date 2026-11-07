@@ -1,0 +1,5 @@
+﻿Crate: convert_case v0.4.0
+Source: https://github.com/rutrum/convert-case
+Source URL: https://raw.githubusercontent.com/rutrum/convert-case/master/LICENSE
+License: MIT
+Copyright: Copyright (c) 2025 rutrum

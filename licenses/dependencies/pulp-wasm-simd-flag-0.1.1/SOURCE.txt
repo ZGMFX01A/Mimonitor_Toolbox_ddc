@@ -1,0 +1,5 @@
+﻿Crate: pulp-wasm-simd-flag v0.1.1
+Workspace: https://github.com/sarah-quinones/pulp
+Source URL: https://raw.githubusercontent.com/sarah-quinones/pulp/master/LICENSE
+License: MIT
+Copyright: Copyright (c) 2021 sarah

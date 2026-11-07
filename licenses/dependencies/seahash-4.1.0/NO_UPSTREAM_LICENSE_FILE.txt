@@ -1,0 +1,7 @@
+﻿Crate: seahash v4.1.0
+Repository: https://gitlab.redox-os.org/redox-os/seahash
+Git Commit: 94b632aeac099031c373599313d5b5f0acbbaec0
+Authors: ticki <ticki@users.noreply.github.com>, Tom Almeida <tom@tommoa.me>
+License: MIT
+Upstream Status: [未取得独立许可文本] 已发布 crate 未附独立 LICENSE 文本；本次未取得上游仓库对应原文，不能断言上游不存在该文件。
+开源许可严格依照 Cargo.toml package.license = "MIT" 元数据声明生效。

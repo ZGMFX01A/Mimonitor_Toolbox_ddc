@@ -1,0 +1,4 @@
+﻿Crate: stacksafe-0.1.4
+Workspace: https://github.com/fast/stacksafe
+Source URL: https://raw.githubusercontent.com/fast/stacksafe/main/LICENSE
+License: Apache-2.0

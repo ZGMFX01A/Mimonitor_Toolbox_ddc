@@ -1,0 +1,9 @@
+﻿Crate: lyon_tessellation-1.0.23
+Workspace: https://github.com/nical/lyon
+Source URLs:
+  - https://raw.githubusercontent.com/nical/lyon/master/LICENSE-MIT
+  - https://raw.githubusercontent.com/nical/lyon/master/LICENSE-APACHE
+License: MIT OR Apache-2.0
+Copyright:
+  - MIT: Copyright (c) 2013 Nicolas Silva
+  - Apache: Copyright 2016 Nicolas Silva

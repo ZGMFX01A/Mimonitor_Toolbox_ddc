@@ -1,0 +1,5 @@
+﻿Crate: simd_helpers v0.1.0
+Repository: https://github.com/lu-zero/simd_helpers
+Source URL: https://raw.githubusercontent.com/lu-zero/simd_helpers/master/LICENSE
+License: MIT
+Copyright: Copyright (c) 2019 Luca Barbato

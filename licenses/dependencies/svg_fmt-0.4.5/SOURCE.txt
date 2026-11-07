@@ -1,0 +1,5 @@
+﻿Crate: svg_fmt v0.4.5
+Workspace: https://github.com/nical/rust_debug
+Source URL: https://raw.githubusercontent.com/nical/rust_debug/master/LICENSE
+License: MIT (declared as MIT/Apache-2.0 in metadata)
+Copyright: Copyright (c) 2019 Nicolas Silva

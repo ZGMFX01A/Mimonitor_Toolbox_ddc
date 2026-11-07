@@ -1,0 +1,47 @@
+[package]
+name = "mimonitor_toolbox_ddc"
+version = "0.1.0"
+edition = "2021"
+default-run = "mimonitor_toolbox_ddc"
+authors = ["Mimonitor Toolbox Contributors"]
+description = "Redmi G Pro 27U & Multi-Monitor DDC/CI Toolbox in Rust + GPUI"
+
+[dependencies]
+# GPUI 官方锁定版本 (Windows Direct3D / Win32 / DirectWrite 原生支持)
+gpui = { version = "0.2.2", default-features = false, features = ["windows-manifest"] }
+
+# 强类型配置序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 轻量线程同步与并发
+parking_lot = "0.12"
+
+# 基础工具
+uuid = { version = "1.0", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+encoding_rs = "0.8"
+raw-window-handle = "0.6"
+
+# Win32 API 支持
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+unicode-segmentation = "1.12"
+
+[build-dependencies]
+embed-resource = "3.0.12"

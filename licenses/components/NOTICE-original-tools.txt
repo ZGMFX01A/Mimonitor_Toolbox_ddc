@@ -1,0 +1,26 @@
+================================================================================
+Mimonitor Toolbox 伴随运行辅助工具归属说明 (Auxiliary Tools Notice)
+================================================================================
+
+本项目打包分发的下列内置辅助工具及预编译产物，均继承自原项目 Mimonitor_Toolbox
+与相关子项目，专用于推送到显示器端（Android 系统）执行或由宿主触发。
+保留原始源码归属说明，不虚构专有闭源授权，不引入虚构作者：
+
+1. MtkDirectTool.jar (assets/runtime/MtkDirectTool.jar)
+   - 源码来源: 原项目 tools/mtk_direct/MtkDirectTool.java
+   - 目标环境: 显示器端 Android runtime (通过 app_process / dalvikvm 远程调用)
+   - 用途: 小米/红米显示器 MTK 底层 JNI 寄存器读写与 com.xiaomi.mitv.action.PIC_MODE_CHANGED 画质刷新广播。
+
+2. ColorfulLedTool.jar (assets/runtime/ColorfulLedTool.jar)
+   - 源码来源: 原项目 tools/colorful_led/ColorfulLedTool.java
+   - 目标环境: 显示器端 Android runtime (通过 app_process 远程调用)
+   - 用途: 小米显示器 PM2 彩色氛围灯/屏幕挂灯 HIDL 接口控制 (lighting/ambient/solid/cycle/off 模式)。
+
+3. AdbGuardian (assets/adb_guardian/adbguardian-signed.apk)
+   - 源码项目: /home/hq/mitv/adb_guardian
+   - 内置版本: versionCode 5 / versionName 3.2
+   - 目标环境: 显示器端 Android 独立安装的无障碍辅助服务应用
+   - 用途: 保持设备休眠唤醒、重启后的 TCP 5555 无线 ADB 端口持续开启与自愈。
+
+4. 应用程序图标 (assets/app/icon.ico)
+   - 来源: Mimonitor Toolbox 原生应用专有图标资源。

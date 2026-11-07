@@ -1,0 +1,7 @@
+﻿Crate: dtor-proc-macro-0.0.5
+Workspace: https://github.com/mmastrac/rust-ctor
+Source URLs:
+  - https://raw.githubusercontent.com/mmastrac/rust-ctor/master/LICENSE-MIT
+  - https://raw.githubusercontent.com/mmastrac/rust-ctor/master/LICENSE-APACHE
+License: Apache-2.0 OR MIT
+Notice: Shared workspace license for dtor & dtor-proc-macro.
