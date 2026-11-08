@@ -2,7 +2,7 @@
 
 ADB and its support DLLs in this directory are embedded into the Rust executable.
 The app extracts them to its private versioned runtime directory. The helper
-JARs remain companion assets and execute on the display's Android system.
+JARs are also embedded and extracted there before being pushed to the display's Android system.
 
 - `adb.exe`: ADB client used by the desktop app.
 - `AdbWinApi.dll` and `AdbWinUsbApi.dll`: Windows ADB runtime libraries.

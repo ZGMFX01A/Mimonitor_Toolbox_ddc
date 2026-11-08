@@ -435,7 +435,9 @@ impl AdbDevice {
     /// 断开连接
     pub fn disconnect(&self) -> Result<(), AdbError> {
         let serial = self.serial();
-        adb_run(&["disconnect", &serial]).map_err(AdbError::CommandFailed)?;
+        // Cleanup must survive cancellation of the session being disconnected.
+        adb_run_with_timeout(&["disconnect", &serial], Duration::from_secs(2))
+            .map_err(AdbError::CommandFailed)?;
         Ok(())
     }
 

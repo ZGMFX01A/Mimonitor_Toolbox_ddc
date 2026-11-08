@@ -25,20 +25,32 @@ pub fn card_container() -> Div {
 /// 构建通用静态按钮
 pub fn button(label: impl Into<SharedString>) -> Div {
     div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(32.0))
         .px_3()
-        .py_1()
         .bg(rgb(ThemeColors::BG_BUTTON()))
         .border_1()
         .border_color(rgb(ThemeColors::BORDER()))
         .rounded_md()
-        .text_xs()
+        .text_size(px(13.0))
         .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
         .child(label.into())
 }
 
 /// 构建可交互动作按钮
 pub fn action_button(label: impl Into<SharedString>, is_primary: bool, is_disabled: bool) -> Div {
-    let base = div().px_3().py_1().rounded_md().text_xs().border_1();
+    let base = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(32.0))
+        .px_3()
+        .rounded_md()
+        .text_size(px(13.0))
+        .line_height(px(20.0))
+        .border_1();
 
     if is_disabled {
         base.bg(rgb(ThemeColors::BG_DISABLED()))
@@ -48,6 +60,7 @@ pub fn action_button(label: impl Into<SharedString>, is_primary: bool, is_disabl
         base.bg(rgb(ThemeColors::ACCENT_CYAN()))
             .border_color(rgb(ThemeColors::ACCENT_CYAN()))
             .text_color(rgb(ThemeColors::TEXT_ON_ACCENT()))
+            .font_weight(gpui::FontWeight::MEDIUM)
             .cursor_pointer()
             .hover(|s| s.bg(rgb(ThemeColors::ACCENT_HOVER())))
     } else {
@@ -55,7 +68,10 @@ pub fn action_button(label: impl Into<SharedString>, is_primary: bool, is_disabl
             .border_color(rgb(ThemeColors::BORDER()))
             .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
             .cursor_pointer()
-            .hover(|s| s.bg(rgb(ThemeColors::BG_BUTTON_HOVER())))
+            .hover(|s| {
+                s.bg(rgb(ThemeColors::BG_BUTTON_HOVER()))
+                    .border_color(rgb(ThemeColors::BORDER()))
+            })
     }
     .child(label.into())
 }
@@ -63,17 +79,53 @@ pub fn action_button(label: impl Into<SharedString>, is_primary: bool, is_disabl
 /// 构建通用状态胶囊徽章
 pub fn badge(label: impl Into<SharedString>, bg_color: u32, text_color: u32) -> Div {
     div()
+        .flex()
+        .items_center()
+        .justify_center()
         .px_2()
-        .py_1()
+        .py(px(2.0))
         .rounded_md()
-        .text_xs()
+        .text_size(px(12.0))
+        .line_height(px(16.0))
         .bg(rgb(bg_color))
         .text_color(rgb(text_color))
         .child(label.into())
 }
 
 pub fn option_button(label: impl Into<SharedString>, selected: bool, disabled: bool) -> Div {
-    action_button(label, selected, disabled)
+    let base = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(32.0))
+        .px_3()
+        .rounded_md()
+        .text_size(px(13.0))
+        .line_height(px(20.0))
+        .border_1();
+
+    if disabled {
+        base.bg(rgb(ThemeColors::BG_DISABLED()))
+            .border_color(rgb(ThemeColors::BORDER_DISABLED()))
+            .text_color(rgb(ThemeColors::TEXT_DISABLED()))
+    } else if selected {
+        base.bg(rgb(ThemeColors::ACCENT_BG_SUBTLE()))
+            .border_color(rgb(ThemeColors::ACCENT_CYAN()))
+            .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())))
+    } else {
+        base.bg(rgb(ThemeColors::BG_BUTTON()))
+            .border_color(rgb(ThemeColors::BORDER()))
+            .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
+            .cursor_pointer()
+            .hover(|s| {
+                s.bg(rgb(ThemeColors::BG_BUTTON_HOVER()))
+                    .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
+            })
+    }
+    .child(label.into())
 }
 
 /// 进度条与滑块视觉展示

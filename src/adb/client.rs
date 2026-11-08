@@ -399,54 +399,14 @@ pub fn get_bundled_adb_path() -> PathBuf {
         return PathBuf::from(override_path);
     }
 
-    // Private runtime is embedded in the application. Never consult CWD or PATH.
-    let dir = crate::config::get_app_data_dir()
-        .join("runtime")
-        .join(env!("CARGO_PKG_VERSION"));
-    let resources: &[(&str, &[u8])] = &[
-        ("adb.exe", include_bytes!("../../assets/runtime/adb.exe")),
-        (
-            "AdbWinApi.dll",
-            include_bytes!("../../assets/runtime/AdbWinApi.dll"),
-        ),
-        (
-            "AdbWinUsbApi.dll",
-            include_bytes!("../../assets/runtime/AdbWinUsbApi.dll"),
-        ),
-    ];
-    static DEPLOY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
-    let deployed = DEPLOY.get_or_init(|| {
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        for (name, bytes) in resources {
-            let path = dir.join(name);
-            if std::fs::read(&path).ok().as_deref() != Some(*bytes) {
-                let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
-                std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
-                std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-            }
+    match crate::resources::runtime_file("adb.exe") {
+        Ok(path) => path,
+        Err(error) => {
+            crate::logger::log_adb(&format!("内置 ADB 解包失败：{error}"));
+            // Explicit failure, never fall back to a tool from PATH or CWD.
+            crate::config::get_app_data_dir().join("runtime/unavailable/adb.exe")
         }
-        // The portable package supplies the official redistributable beside the EXE.
-        if let Some(parent) = env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(Path::to_path_buf))
-        {
-            let crt = parent.join("vcruntime140.dll");
-            if crt.is_file() {
-                let bytes = std::fs::read(crt).map_err(|e| e.to_string())?;
-                let target = dir.join("vcruntime140.dll");
-                if std::fs::read(&target).ok().as_deref() != Some(bytes.as_slice()) {
-                    std::fs::write(target, bytes).map_err(|e| e.to_string())?;
-                }
-            }
-        }
-        Ok(())
-    });
-    if let Err(error) = deployed {
-        crate::logger::log_adb(&format!("内置 ADB 解包失败：{error}"));
-        // A missing private path produces an explicit launch error; no external fallback.
-        return dir.join("unavailable").join("adb.exe");
     }
-    dir.join("adb.exe")
 }
 
 /// 检查特定端口的 ADB Server 是否处于监听就绪状态

@@ -33,33 +33,7 @@ pub fn parse_jni_batch_output(raw_output: &str) -> HashMap<String, i32> {
 
 /// 定位本地分发的 MtkDirectTool.jar 文件路径
 pub fn get_local_mtk_tool_path() -> Option<PathBuf> {
-    // 1. 尝试当前 exe 相对路径
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let p = parent
-                .join("assets")
-                .join("runtime")
-                .join(MTK_DIRECT_TOOL_JAR);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    // 2. 尝试工作区相对路径
-    let p = Path::new("assets")
-        .join("runtime")
-        .join(MTK_DIRECT_TOOL_JAR);
-    if p.exists() {
-        return Some(p);
-    }
-    // 3. 尝试持久化 runtime 目录
-    let persistent_p = crate::config::get_app_data_dir()
-        .join("runtime")
-        .join(MTK_DIRECT_TOOL_JAR);
-    if persistent_p.exists() {
-        return Some(persistent_p);
-    }
-    None
+    crate::resources::helper_path(MTK_DIRECT_TOOL_JAR)
 }
 
 /// 检查并修复设备端远程 JAR（比对 stat -c %s 大小，缺失或不符则自动推送并部署到 cache）

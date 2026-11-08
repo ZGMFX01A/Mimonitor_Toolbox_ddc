@@ -601,11 +601,24 @@ impl Render for TextInput {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_focused = self.focus_handle.is_focused(window);
 
+        let bg_color = if is_focused {
+            ThemeColors::BG_CARD()
+        } else {
+            ThemeColors::BG_BUTTON()
+        };
+
+        let border_color = if is_focused {
+            ThemeColors::ACCENT_CYAN()
+        } else {
+            ThemeColors::BORDER()
+        };
+
         div()
             .flex()
             .flex_row()
             .items_center()
             .w_full()
+            .h(px(32.0))
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
@@ -626,16 +639,12 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .px_3()
-            .py_1()
-            .bg(rgb(crate::ui::theme::ThemeColors::BG_CARD()))
+            .py(px(4.0))
+            .bg(rgb(bg_color))
             .border_1()
-            .border_color(if is_focused {
-                rgb(ThemeColors::ACCENT_CYAN())
-            } else {
-                rgb(ThemeColors::BORDER())
-            })
+            .border_color(rgb(border_color))
             .rounded_md()
-            .line_height(px(22.0))
+            .line_height(px(20.0))
             .text_size(px(13.0))
             .child(TextElement { input: cx.entity() })
     }

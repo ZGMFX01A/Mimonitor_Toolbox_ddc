@@ -9,6 +9,13 @@ use crate::presets::ApplyResult;
 /// 界面向后台工作管道提交的强类型业务指令（均携带会话或代数标识）
 #[derive(Debug, Clone)]
 pub enum AppCommand {
+    EditPresetConfig { mutation: preset_sync::PresetConfigMutation, request_id: u64 },
+    TrayValueCommit {
+        param: crate::hotkey::AdjustParam,
+        value: i32,
+        generation: u64,
+        request_id: u64,
+    },
     Hotkey {
         event: crate::hotkey::HotkeyEvent,
         generation: u64,
@@ -166,6 +173,16 @@ pub enum AppCommand {
 /// 后台向界面通知的异步业务事件
 #[derive(Debug, Clone)]
 pub enum AppEvent {
+    PresetConfigResult {
+        request_id: u64,
+        mutation: preset_sync::PresetConfigMutation,
+        error: Option<String>,
+    },
+    TrayValueResult {
+        request_id: u64,
+        generation: u64,
+        error: Option<String>,
+    },
     GuardianStatusUpdated {
         status: crate::device::guardian::GuardianStatus,
         generation: u64,
@@ -323,6 +340,7 @@ pub enum AppEvent {
 }
 
 pub mod actions;
+pub mod preset_sync;
 mod runtime;
 mod scheduler;
 mod shortcuts;

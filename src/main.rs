@@ -1,20 +1,25 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(all(not(debug_assertions), target_env = "msvc", not(target_feature = "crt-static")))]
+compile_error!("Release builds require the static CRT configured in .cargo/config.toml");
+
 pub mod adb;
 pub mod config;
 pub mod ddc;
 pub mod device;
 pub mod hotkey;
+mod instance;
 pub mod logger;
 pub mod message;
 pub mod presets;
+mod resources;
 pub mod tray;
 pub mod ui;
 
 use gpui::prelude::*;
 use gpui::{
     div, point, px, rgb, size, AnyWindowHandle, App, Application, Bounds, Context, Entity,
-    InteractiveElement, IntoElement, Pixels, Point, Render, SharedString,
+    InteractiveElement, IntoElement, Pixels, Point, Render,
     StatefulInteractiveElement, Subscription, Window, WindowBounds, WindowOptions,
 };
 use parking_lot::Mutex;
@@ -34,6 +39,50 @@ use crate::ui::pages::preset::PresetPageView;
 use crate::ui::pages::*;
 use crate::ui::theme::ThemeColors;
 use crate::ui::tray_popup::TrayBrightnessPopupView;
+use crate::ui::tray_value_popup::TrayValuePopupView;
+
+fn monitor_ip(input: &str) -> Result<String, &'static str> {
+    let raw = input.trim();
+    // Accept the former saved :5555 form without exposing a port field.
+    let raw = raw.strip_suffix(":5555").unwrap_or(raw);
+    raw.parse::<std::net::Ipv4Addr>().map(|ip| ip.to_string())
+        .map_err(|_| "请输入显示器 IP，例如 192.168.31.200")
+}
+
+fn single_scan_target(devices: &[DiscoveredDevice]) -> Option<String> {
+    let mut eligible = devices.iter().filter(|d| d.is_mitv || adb::is_mitv_model(&d.model));
+    let first = eligible.next()?;
+    eligible.next().is_none().then(|| first.ip.clone())
+}
+
+#[cfg(test)]
+mod connection_ux_tests {
+    use super::*;
+    #[test]
+    fn ip_input_uses_fixed_device_port_and_accepts_legacy_saved_form() {
+        for input in ["192.168.31.200", " 192.168.31.200:5555 "] {
+            let ip = monitor_ip(input).unwrap();
+            assert_eq!(ip, "192.168.31.200");
+            assert_eq!(adb::AdbDevice::new(ip).serial(), "192.168.31.200:5555");
+        }
+        assert!(monitor_ip("192.168.31.200:6000").is_err());
+        assert!(monitor_ip("999.1.1.1").is_err());
+        assert!(monitor_ip("").is_err());
+    }
+    #[test]
+    fn scanning_auto_selects_only_an_unambiguous_monitor() {
+        let device = |ip: &str, model: &str| DiscoveredDevice {
+            ip: ip.into(), model: model.into(), is_mitv: adb::is_mitv_model(model),
+        };
+        let first = device("192.168.31.200", "MiTV-MFFU1");
+        let other = device("192.168.31.201", "Redmi");
+        assert_eq!(single_scan_target(&[first.clone()]), Some(first.ip.clone()));
+        assert_eq!(single_scan_target(&[first.clone(), device("192.168.31.10", "Android Phone")]), Some(first.ip.clone()));
+        assert_eq!(single_scan_target(&[first, other]), None);
+        assert_eq!(single_scan_target(&[device("192.168.31.10", "Android Phone")]), None);
+        assert_eq!(single_scan_target(&[]), None);
+    }
+}
 
 /// 全局共享状态实体 (由后台消息总线驱动，驱动主窗口与托盘面板同步重绘)
 pub struct AppState {
@@ -53,6 +102,7 @@ pub struct AppState {
     pub ddc_refresh_count: u64,
     pub toast: Option<(String, bool)>,
     pub device_busy: bool,
+    pub tray_value_results: std::collections::BTreeMap<u64, (u64, Option<String>)>,
     pub text_input: Entity<TextInput>,
     pub source_page: Entity<crate::ui::pages::source::SourcePage>,
     pub remote_page: Entity<crate::ui::pages::remote::RemotePage>,
@@ -72,7 +122,7 @@ impl AppState {
         config: AppConfig,
         cx: &mut Context<Self>,
     ) -> Self {
-        let saved_ip = config.saved_ip.clone();
+        let saved_ip = monitor_ip(&config.saved_ip).unwrap_or_default();
         let initial_input = if saved_ip.trim().is_empty() {
             "".to_string()
         } else {
@@ -80,7 +130,7 @@ impl AppState {
         };
 
         let text_input =
-            cx.new(|cx| TextInput::new(cx, "例如 192.168.5.19:5555", initial_input.clone()));
+            cx.new(|cx| TextInput::new(cx, "例如 192.168.31.200", initial_input.clone()));
         let source_page = cx.new(|cx| crate::ui::pages::source::SourcePage::new(bus.clone(), cx));
         let remote_page = cx.new(|cx| crate::ui::pages::remote::RemotePage::new(bus.clone(), cx));
 
@@ -113,6 +163,7 @@ impl AppState {
             display_summary: "统一多屏亮度管理".into(),
             ddc_refresh_count: 0,
             device_busy: false,
+            tray_value_results: Default::default(),
             toast: if crate::config::migration_blocked() {
                 Some((
                     "旧配置备份失败，已进入只读模式；请检查备份目录权限后重启".into(),
@@ -132,6 +183,51 @@ impl AppState {
             auto_task_page,
             tray_page,
         }
+    }
+
+    fn connect_ip(&mut self, input: &str, cx: &mut Context<Self>) {
+        if self.is_adb_connecting { return; }
+        let ip = match monitor_ip(input) {
+            Ok(ip) => ip,
+            Err(message) => {
+                self.toast = Some((message.into(), true));
+                cx.notify();
+                return;
+            }
+        };
+        if self.is_adb_scanning {
+            self.bus.cancel_scan();
+            self.is_adb_scanning = false;
+        }
+        let bus = self.bus.clone();
+        let generation = bus.active_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.is_adb_connecting = true;
+        self.adb_state = AdbDeviceState::NotFound;
+        self.adb_backlight = None;
+        self.adb_ip = ip.clone();
+        self.config.saved_ip = ip.clone();
+        self.text_input.update(cx, |input, cx| input.set_text(ip.clone(), cx));
+        self.picture_page.update(cx, |page, cx| page.on_adb_state_changed(&AdbDeviceState::NotFound, generation, cx));
+        self.game_page.update(cx, |page, cx| page.handle_connection_state(false, generation, cx));
+        self.tools_page.update(cx, |page, cx| page.set_connected(false, generation, None, cx));
+        self.source_page.update(cx, |page, cx| page.set_connected(false, generation, cx));
+        self.remote_page.update(cx, |page, cx| page.set_connected(false, generation, cx));
+        self.light_state = ScreenLightState::default();
+        self.toast = None;
+        let ip_to_save = ip.clone();
+        let save_bus = bus.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = crate::config::update_settings(|cfg| cfg.saved_ip = ip_to_save) {
+                let _ = save_bus.event_sender.send(AppEvent::ToastNotification {
+                    message: format!("保存连接地址失败：{error}"), is_error: true,
+                });
+            }
+        });
+        if bus.cmd_sender.send(AppCommand::ConnectAdb { ip, generation }).is_err() {
+            self.is_adb_connecting = false;
+            self.toast = Some(("连接失败：后台已停止".into(), true));
+        }
+        cx.notify();
     }
 }
 
@@ -153,61 +249,8 @@ impl MainWindow {
     }
 
     fn on_connect(&mut self, cx: &mut Context<Self>) {
-        let state = self.app_state.read(cx);
-        let bus = state.bus.clone();
-        let ip = state.text_input.read(cx).text().trim().to_string();
-        if ip.is_empty() {
-            self.app_state.update(cx, |st, cx| {
-                st.toast = Some(("请输入合法的设备 IP:端口".into(), true));
-                cx.notify();
-            });
-            return;
-        }
-        let gen = bus.active_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut cfg_to_save = state.config.clone();
-        cfg_to_save.saved_ip = ip.clone();
-        let bus_for_save = bus.clone();
-
-        self.app_state.update(cx, |st, cx| {
-            st.is_adb_connecting = true;
-            st.adb_state = AdbDeviceState::NotFound;
-            st.adb_backlight = None;
-            st.picture_page.update(cx, |page, cx| {
-                page.on_adb_state_changed(&AdbDeviceState::NotFound, gen, cx)
-            });
-            st.game_page
-                .update(cx, |page, cx| page.handle_connection_state(false, gen, cx));
-            st.tools_page
-                .update(cx, |page, cx| page.set_connected(false, gen, cx));
-            st.adb_ip = ip.clone();
-            st.config.saved_ip = ip.clone();
-            // 提交新 IP 连接时立即置为未连接并更新 generation，防止新会话握手前误用旧连接发送命令
-            st.source_page.update(cx, |sp, cx| {
-                sp.set_connected(false, gen, cx);
-            });
-            st.remote_page.update(cx, |rp, cx| {
-                rp.set_connected(false, gen, cx);
-            });
-            st.light_state = ScreenLightState::default();
-            cx.notify();
-        });
-
-        // 异步保存配置，保障 UI 线程零阻塞 IO
-        std::thread::spawn(move || {
-            if let Err(e) =
-                crate::config::update_settings(|current| current.saved_ip = cfg_to_save.saved_ip)
-            {
-                let _ = bus_for_save.event_sender.send(AppEvent::ToastNotification {
-                    message: format!("保存配置失败: {}", e),
-                    is_error: true,
-                });
-            }
-        });
-
-        let _ = bus.cmd_sender.send(AppCommand::ConnectAdb {
-            ip,
-            generation: gen,
-        });
+        let ip = self.app_state.read(cx).text_input.read(cx).text().to_string();
+        self.app_state.update(cx, |st, cx| st.connect_ip(&ip, cx));
     }
 
     fn on_cancel_connect(&mut self, cx: &mut Context<Self>) {
@@ -235,6 +278,7 @@ impl MainWindow {
         self.app_state.update(cx, |st, cx| {
             st.is_adb_scanning = true;
             st.discovered_devices.clear();
+            st.toast = None;
             cx.notify();
         });
         let _ = bus.cmd_sender.send(AppCommand::ScanNetworkDevices {
@@ -252,10 +296,9 @@ impl MainWindow {
     }
 
     fn on_select_discovered_ip(&mut self, selected_ip: &str, cx: &mut Context<Self>) {
-        let text_input = self.app_state.read(cx).text_input.clone();
-        let ip_str: SharedString = selected_ip.to_string().into();
-        text_input.update(cx, |input, cx| {
-            input.set_text(ip_str, cx);
+        self.app_state.update(cx, |st, cx| {
+            if st.adb_state.is_connected() && st.adb_ip == selected_ip { return; }
+            st.connect_ip(selected_ip, cx);
         });
     }
 
@@ -434,8 +477,21 @@ impl Render for MainWindow {
             remote_page,
             light_state,
             picture_page,
+            active_preset_name,
         ) = {
             let state = self.app_state.read(cx);
+            let active_preset_name = state
+                .config
+                .active_preset_id
+                .as_ref()
+                .and_then(|id| {
+                    state
+                        .config
+                        .presets
+                        .iter()
+                        .find(|p| p.id == *id)
+                        .map(|p| p.name.clone())
+                });
             (
                 state.active_tab.clone(),
                 state.adb_state.clone(),
@@ -452,21 +508,22 @@ impl Render for MainWindow {
                 state.remote_page.clone(),
                 state.light_state.clone(),
                 state.picture_page.clone(),
+                active_preset_name,
             )
         };
         let app_state_entity = self.app_state.clone();
 
-        let tabs = [
-            "主页 & 连接",
-            "画面设置",
-            "游戏模式",
-            "信号源切换",
-            "屏幕灯",
-            "托盘菜单",
-            "预设模式",
-            "自动任务",
-            "工具与设置",
-            "遥控器",
+        let nav_items: [(&str, &str, Option<&str>); 10] = [
+            ("主页 & 连接", "主页连接", Some("设备控制")),
+            ("画面设置", "画面设置", None),
+            ("游戏模式", "游戏模式", None),
+            ("信号源切换", "信号源", None),
+            ("屏幕灯", "屏幕灯", None),
+            ("托盘菜单", "托盘菜单", Some("自动化与设置")),
+            ("预设模式", "预设模式", None),
+            ("自动任务", "自动任务", None),
+            ("工具与设置", "工具设置", None),
+            ("遥控器", "遥控器", None),
         ];
 
         div()
@@ -498,10 +555,24 @@ impl Render for MainWindow {
                             .window_control_area(gpui::WindowControlArea::Drag)
                             .child(
                                 div()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(ThemeColors::ACCENT_CYAN()))
-                                    .child("Mimonitor 工具箱"),
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .w(px(7.0))
+                                            .h(px(7.0))
+                                            .rounded_full()
+                                            .bg(rgb(ThemeColors::ACCENT_CYAN())),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
+                                            .child("Mimonitor 工具箱"),
+                                    ),
                             )
                             .child(
                                 div()
@@ -515,20 +586,25 @@ impl Render for MainWindow {
                         div()
                             .flex()
                             .items_center()
-                            .gap_1()
+                            .gap_2()
+                            .flex_shrink_0()
                             .child(
                                 div()
                                     .id("open-brightness-panel")
                                     .border_1()
                                     .border_color(rgb(ThemeColors::ACCENT_CYAN()))
-                                    .bg(rgb(ThemeColors::ACCENT_BG_SUBTLE()))
-                                    .text_color(rgb(ThemeColors::ACCENT_CYAN()))
+                                    .bg(rgb(ThemeColors::ACCENT_CYAN()))
+                                    .text_color(rgb(ThemeColors::TEXT_ON_ACCENT()))
                                     .cursor_pointer()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
                                     .px_3()
-                                    .py_1()
+                                    .h(px(28.0))
                                     .rounded_md()
                                     .text_xs()
-                                    .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .hover(|s| s.bg(rgb(ThemeColors::ACCENT_HOVER())).border_color(rgb(ThemeColors::ACCENT_HOVER())))
                                     .child("☀ 亮度面板")
                                     .on_click({
                                         let bus = self.app_state.read(cx).bus.clone();
@@ -539,61 +615,126 @@ impl Render for MainWindow {
                             )
                             .child(
                                 div()
-                                    .id("window-minimize")
-                                    .w(px(36.0))
-                                    .h(px(28.0))
                                     .flex()
                                     .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())))
-                                    .child("—")
-                                    .on_click(|_, window, _| window.minimize_window()),
-                            )
-                            .child(
-                                div()
-                                    .id("window-maximize")
-                                    .w(px(36.0))
-                                    .h(px(28.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())))
-                                    .child("□")
-                                    .window_control_area(gpui::WindowControlArea::Max),
-                            )
-                            .child(
-                                div()
-                                    .id("window-close")
-                                    .w(px(36.0))
-                                    .h(px(28.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_md()
-                                    .text_xs()
-                                    .hover(|s| s.bg(rgb(0xC42B1C)))
-                                    .child("×")
-                                    .window_control_area(gpui::WindowControlArea::Close),
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .id("window-minimize")
+                                            .w(px(32.0))
+                                            .h(px(28.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
+                                            .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())).text_color(rgb(ThemeColors::TEXT_PRIMARY())))
+                                            .child("—")
+                                            .on_click(|_, window, _| window.minimize_window()),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("window-maximize")
+                                            .w(px(32.0))
+                                            .h(px(28.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
+                                            .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())).text_color(rgb(ThemeColors::TEXT_PRIMARY())))
+                                            .child("□")
+                                            .window_control_area(gpui::WindowControlArea::Max),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("window-close")
+                                            .w(px(32.0))
+                                            .h(px(28.0))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
+                                            .hover(|s| s.bg(rgb(0xC42B1C)).text_color(rgb(0xffffff)))
+                                            .child("×")
+                                            .window_control_area(gpui::WindowControlArea::Close),
+                                    ),
                             ),
                     ),
             )
             .children(toast.as_ref().map(|(message, error)| {
+                let app_state_for_close_toast = app_state_entity.clone();
+                let is_err = *error;
                 div()
                     .flex_shrink_0()
                     .px_4()
                     .py_2()
-                    .text_xs()
-                    .bg(rgb(ThemeColors::BG_CARD()))
-                    .text_color(rgb(if *error {
+                    .border_b_1()
+                    .border_color(rgb(if is_err {
                         ThemeColors::STATUS_ERROR()
                     } else {
-                        ThemeColors::ACCENT_CYAN()
+                        ThemeColors::STATUS_SUCCESS()
                     }))
-                    .child(message.clone())
+                    .bg(rgb(if is_err {
+                        ThemeColors::STATUS_ERROR_BG()
+                    } else {
+                        ThemeColors::STATUS_SUCCESS_BG()
+                    }))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(rgb(if is_err {
+                                        ThemeColors::STATUS_ERROR()
+                                    } else {
+                                        ThemeColors::STATUS_SUCCESS()
+                                    }))
+                                    .child(if is_err { "⚠ 提示" } else { "✓ 成功" }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(message.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("btn_close_toast")
+                            .cursor_pointer()
+                            .px_1p5()
+                            .py(px(2.0))
+                            .rounded_md()
+                            .text_xs()
+                            .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
+                            .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())).text_color(rgb(ThemeColors::TEXT_PRIMARY())))
+                            .child("✕")
+                            .on_click(cx.listener(move |_this, _, _, cx| {
+                                app_state_for_close_toast.update(cx, |st, cx| {
+                                    st.toast = None;
+                                    cx.notify();
+                                });
+                            })),
+                    )
             }))
             // 中间主体：左侧 10 原页面入口导航栏 + 右侧内容区
             .child(
@@ -603,13 +744,13 @@ impl Render for MainWindow {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    // 左侧导航侧边栏 (宽168px，在160-176区间内)
+                    // 左侧导航侧边栏 (宽160px，自适应纵向滚动)
                     .child(
                         div()
                             .id("sidebar-scroll")
                             .overflow_y_scroll()
                             .min_h_0()
-                            .w(px(168.0))
+                            .w(px(160.0))
                             .flex_shrink_0()
                             .flex()
                             .flex_col()
@@ -618,57 +759,72 @@ impl Render for MainWindow {
                             .bg(rgb(crate::ui::theme::ThemeColors::BG_CARD()))
                             .border_r_1()
                             .border_color(rgb(ThemeColors::BORDER()))
-                            .child(div().flex().flex_col().gap_1().children(
-                                tabs.into_iter().enumerate().map(|(idx, tab_name)| {
-                                    let is_active = tab_name == active_tab;
-                                    let name_str = tab_name.to_string();
+                            .child(div().flex().flex_col().gap_0p5().children(
+                                nav_items.into_iter().enumerate().map(|(idx, (tab_key, tab_label, group_header))| {
+                                    let is_active = tab_key == active_tab;
+                                    let name_str = tab_key.to_string();
                                     let app_state_for_click = app_state_entity.clone();
 
                                     div()
-                                        .id(("nav_item", idx))
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_md()
-                                        .text_xs()
-                                        .font_weight(if is_active {
-                                            gpui::FontWeight::BOLD
-                                        } else {
-                                            gpui::FontWeight::NORMAL
-                                        })
-                                        .bg(if is_active {
-                                            rgb(ThemeColors::ACCENT_BG_SUBTLE())
-                                        } else {
-                                            rgb(crate::ui::theme::ThemeColors::BG_CARD())
-                                        })
-                                        .border_1()
-                                        .border_color(if is_active {
-                                            rgb(ThemeColors::ACCENT_CYAN())
-                                        } else {
-                                            rgb(crate::ui::theme::ThemeColors::BG_CARD())
-                                        })
-                                        .text_color(if is_active {
-                                            rgb(ThemeColors::ACCENT_CYAN())
-                                        } else {
-                                            rgb(ThemeColors::TEXT_SECONDARY())
-                                        })
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())))
-                                        .child(tab_name)
-                                        .on_click(cx.listener(move |_this, _, _, cx| {
-                                            app_state_for_click.update(cx, |st, cx| {
-                                                st.active_tab = name_str.clone();
-                                                cx.notify();
-                                            });
+                                        .flex()
+                                        .flex_col()
+                                        .children(group_header.map(|header| {
+                                            div()
+                                                .pt_2()
+                                                .pb_1()
+                                                .px_2()
+                                                .text_size(px(11.0))
+                                                .font_weight(gpui::FontWeight::BOLD)
+                                                .text_color(rgb(ThemeColors::TEXT_MUTED()))
+                                                .child(header)
                                         }))
+                                        .child(
+                                            div()
+                                                .id(("nav_item", idx))
+                                                .px_3()
+                                                .py_1p5()
+                                                .rounded_md()
+                                                .text_xs()
+                                                .font_weight(if is_active {
+                                                    gpui::FontWeight::BOLD
+                                                } else {
+                                                    gpui::FontWeight::NORMAL
+                                                })
+                                                .bg(if is_active {
+                                                    rgb(ThemeColors::ACCENT_BG_SUBTLE())
+                                                } else {
+                                                    rgb(crate::ui::theme::ThemeColors::BG_CARD())
+                                                })
+                                                .border_1()
+                                                .border_color(if is_active {
+                                                    rgb(ThemeColors::ACCENT_CYAN())
+                                                } else {
+                                                    rgb(crate::ui::theme::ThemeColors::BG_CARD())
+                                                })
+                                                .text_color(if is_active {
+                                                    rgb(ThemeColors::ACCENT_CYAN())
+                                                } else {
+                                                    rgb(ThemeColors::TEXT_SECONDARY())
+                                                })
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())).text_color(rgb(ThemeColors::TEXT_PRIMARY())))
+                                                .child(tab_label)
+                                                .on_click(cx.listener(move |_this, _, _, cx| {
+                                                    app_state_for_click.update(cx, |st, cx| {
+                                                        st.active_tab = name_str.clone();
+                                                        cx.notify();
+                                                    });
+                                                })),
+                                        )
                                 }),
                             ))
                             .child(
                                 div()
-                                    .px_3()
+                                    .px_2()
                                     .py_2()
                                     .border_t_1()
                                     .border_color(rgb(ThemeColors::BORDER()))
-                                    .text_xs()
+                                    .text_size(px(11.0))
                                     .text_color(rgb(ThemeColors::TEXT_MUTED()))
                                     .child("本地控制 · 独立通道"),
                             ),
@@ -682,7 +838,65 @@ impl Render for MainWindow {
                             .min_h_0()
                             .min_w_0()
                             .overflow_y_scroll()
-                            .p_6()
+                            .p_5()
+                            .children(active_preset_name.as_ref().map(|name| {
+                                div()
+                                    .mb_4()
+                                    .flex()
+                                    .flex_row()
+                                    .flex_wrap()
+                                    .justify_between()
+                                    .items_center()
+                                    .gap_2()
+                                    .p_3()
+                                    .rounded_lg()
+                                    .bg(rgb(crate::ui::theme::ThemeColors::ACCENT_BG_SUBTLE()))
+                                    .border_1()
+                                    .border_color(rgb(crate::ui::theme::ThemeColors::ACCENT_CYAN()))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_2()
+                                            .min_w_0()
+                                            .child(crate::ui::components::badge(
+                                                "当前预设",
+                                                crate::ui::theme::ThemeColors::ACCENT_CYAN(),
+                                                crate::ui::theme::ThemeColors::TEXT_ON_ACCENT(),
+                                            ))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(crate::ui::theme::ThemeColors::TEXT_PRIMARY()))
+                                                    .child(format!("正在编辑：{} · 画面调整将自动保存", name)),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("btn_nav_manage_presets")
+                                            .flex_shrink_0()
+                                            .cursor_pointer()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .text_xs()
+                                            .border_1()
+                                            .border_color(rgb(crate::ui::theme::ThemeColors::ACCENT_CYAN()))
+                                            .text_color(rgb(crate::ui::theme::ThemeColors::ACCENT_CYAN()))
+                                            .hover(|s| s.bg(rgb(crate::ui::theme::ThemeColors::BG_HOVER())))
+                                            .child("管理预设")
+                                            .on_click({
+                                                let app_state_for_nav = app_state_entity.clone();
+                                                move |_, _, cx| {
+                                                    app_state_for_nav.update(cx, |st, cx| {
+                                                        st.active_tab = "预设模式".to_string();
+                                                        cx.notify();
+                                                    });
+                                                }
+                                            }),
+                                    )
+                            }))
                             .child(match active_tab.as_str() {
                                 "主页 & 连接" => render_home_page(
                                     text_input.clone(),
@@ -692,7 +906,7 @@ impl Render for MainWindow {
                                     is_connecting,
                                     is_scanning,
                                     &discovered,
-                                    toast.as_ref(),
+                                    &adb_ip,
                                     cx,
                                     Self::on_connect,
                                     Self::on_cancel_connect,
@@ -763,9 +977,12 @@ impl Render for MainWindow {
                 div()
                     .flex()
                     .flex_row()
+                    .flex_wrap()
                     .justify_between()
                     .items_center()
-                    .px_6()
+                    .gap_x_4()
+                    .gap_y_1()
+                    .px_4()
                     .py_2()
                     .flex_shrink_0()
                     .border_t_1()
@@ -773,21 +990,64 @@ impl Render for MainWindow {
                     .bg(rgb(crate::ui::theme::ThemeColors::BG_CARD()))
                     .text_xs()
                     .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
-                    .child(div().child(format!(
-                        "ADB 状态: {} {}",
-                        adb_state.display_label(),
-                        if !adb_ip.is_empty() {
-                            format!("({})", adb_ip)
-                        } else {
-                            "".to_string()
-                        }
-                    )))
-                    .child(div().child(format!("DDC/CI 普通屏: {} 台可用", ddc_avail_count)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_3()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .w(px(6.0))
+                                            .h(px(6.0))
+                                            .rounded_full()
+                                            .flex_shrink_0()
+                                            .bg(rgb(if adb_state.is_connected() {
+                                                ThemeColors::STATUS_SUCCESS()
+                                            } else {
+                                                ThemeColors::TEXT_MUTED()
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .child(format!(
+                                                "ADB: {}{}",
+                                                adb_state.display_label(),
+                                                if !adb_ip.is_empty() {
+                                                    format!(" ({})", adb_ip)
+                                                } else {
+                                                    "".to_string()
+                                                }
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(ThemeColors::BORDER()))
+                                    .child("|"),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .child(format!("DDC/CI 普通屏: {} 台可用", ddc_avail_count)),
+                            ),
+                    )
                     .child(
                         div()
                             .id("repository-link")
                             .cursor_pointer()
+                            .flex_shrink_0()
                             .text_color(rgb(ThemeColors::ACCENT_CYAN()))
+                            .hover(|s| s.text_color(rgb(ThemeColors::ACCENT_HOVER())))
                             .child("GitHub · Mimonitor_Toolbox_ddc")
                             .on_click(|_, _, cx| {
                                 cx.open_url("https://github.com/ZGMFX01A/Mimonitor_Toolbox_ddc")
@@ -1186,7 +1446,7 @@ fn native_window(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
     }
 }
 
-fn get_tray_popup_origin() -> Point<Pixels> {
+fn get_tray_popup_origin_with_size(width: f32, height: f32) -> Point<Pixels> {
     #[cfg(target_os = "windows")]
     unsafe {
         use windows::Win32::{
@@ -1211,12 +1471,16 @@ fn get_tray_popup_origin() -> Point<Pixels> {
             let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
             let scale = (dx.max(96) as f32) / 96.0;
             return point(
-                px((info.rcWork.right as f32 / scale - 332.0).max(info.rcWork.left as f32 / scale)),
-                px((info.rcWork.bottom as f32 / scale - 452.0).max(info.rcWork.top as f32 / scale)),
+                px((info.rcWork.right as f32 / scale - width - 12.0).max(info.rcWork.left as f32 / scale)),
+                px((info.rcWork.bottom as f32 / scale - height - 12.0).max(info.rcWork.top as f32 / scale)),
             );
         }
     }
     point(px(1000.0), px(500.0))
+}
+
+fn get_tray_popup_origin() -> Point<Pixels> {
+    get_tray_popup_origin_with_size(320.0, 440.0)
 }
 
 /// 永久隐藏的 Anchor View，用于在主窗口关闭到托盘时保持 GPUI 运行时存活
@@ -1284,12 +1548,30 @@ fn main() {
     }
     let start_in_tray = args.iter().any(|arg| arg == "--tray");
     let is_open_brightness = args.iter().any(|arg| arg == "--open-brightness");
+    let instance = match instance::Instance::acquire(start_in_tray, is_open_brightness) {
+        Ok(Some(instance)) => Arc::new(instance),
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("无法建立单实例通信：{error}");
+            return;
+        }
+    };
 
     // 1. 初始化跨平台日志
     logger::log_info("启动 Mimonitor Toolbox DDC (纯 Rust + 原生 GPUI)...");
 
     // 2. 加载全局配置
-    let config = config::load_settings();
+    let config = {
+        let mut cfg = (*config::load_settings()).clone();
+        let ip = monitor_ip(&cfg.saved_ip).unwrap_or_default();
+        if !ip.is_empty() && ip != cfg.saved_ip {
+            if let Err(error) = config::update_settings(|current| current.saved_ip = ip.clone()) {
+                logger::log_info(&format!("连接地址迁移未保存：{error}"));
+            }
+        }
+        cfg.saved_ip = ip;
+        Arc::new(cfg)
+    };
     logger::log_info(&format!(
         "加载配置文件成功，已保存 IP: '{}', 预设数量: {}, 自动任务数量: {}",
         config.saved_ip,
@@ -1343,6 +1625,9 @@ fn main() {
             Arc::new(Mutex::new(None));
         let tray_popup_handle: Arc<Mutex<Option<AnyWindowHandle>>> = Arc::new(Mutex::new(None));
         let popup_focus_state: Arc<Mutex<(bool, std::time::Instant)>> =
+            Arc::new(Mutex::new((false, std::time::Instant::now())));
+        let value_popup_handle: Arc<Mutex<Option<AnyWindowHandle>>> = Arc::new(Mutex::new(None));
+        let value_popup_focus_state: Arc<Mutex<(bool, std::time::Instant)>> =
             Arc::new(Mutex::new((false, std::time::Instant::now())));
 
         let main_handle_for_open = main_window_handle.clone();
@@ -1428,8 +1713,15 @@ fn main() {
         let open_main_for_popup = open_main_window_for_tray.clone();
         let popup_focus_tracker = popup_focus_state.clone();
         let main_for_popup_owner = main_window_handle.clone();
+        let value_popup_storage_for_brightness = value_popup_handle.clone();
 
         let toggle_tray_popup = move |cx: &mut App| {
+            if let Some(existing_val) = value_popup_storage_for_brightness.lock().take() {
+                let _ = existing_val.update(cx, |_, window, _| {
+                    window.remove_window();
+                });
+            }
+
             let existing = {
                 let mut popup_guard = tray_popup_storage.lock();
                 popup_guard.take()
@@ -1526,6 +1818,126 @@ fn main() {
             }
         };
 
+        // 封装切换/打开通用数值浮窗函数
+        let value_popup_storage = value_popup_handle.clone();
+        let app_state_for_value = app_state.clone();
+        let open_main_for_value = open_main_window_for_tray.clone();
+        let value_popup_focus_tracker = value_popup_focus_state.clone();
+        let main_for_value_owner = main_window_handle.clone();
+        let tray_popup_for_value = tray_popup_handle.clone();
+
+        let open_value_popup = move |param: crate::hotkey::AdjustParam, cx: &mut App| {
+            // 打开数值浮窗前，关闭已有亮度窗，避免互相抢焦点
+            if let Some(existing_brightness) = tray_popup_for_value.lock().take() {
+                let _ = existing_brightness.update(cx, |_, window, _| {
+                    window.remove_window();
+                });
+            }
+
+            // 同类窗口重新打开时关闭旧窗口
+            let existing = {
+                let mut popup_guard = value_popup_storage.lock();
+                popup_guard.take()
+            };
+
+            if let Some(existing_handle) = existing {
+                let _ = existing_handle.update(cx, |_, window, _| {
+                    window.remove_window();
+                });
+            }
+
+            let origin = get_tray_popup_origin_with_size(360.0, 360.0);
+            let bounds = Bounds::new(origin, size(px(360.0), px(360.0)));
+            let app_state_clone = app_state_for_value.clone();
+            let open_main_cb = open_main_for_value.clone();
+            let popup_storage_close = value_popup_storage.clone();
+            let owner = (*main_for_value_owner.lock()).and_then(|handle| {
+                handle
+                    .update(cx, |_, window, _| native_window(window))
+                    .ok()
+                    .flatten()
+            });
+
+            let param_title = format!("{}调节", param.label());
+            let win = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some(param_title.into()),
+                        appears_transparent: true,
+                        traffic_light_position: None,
+                    }),
+                    kind: gpui::WindowKind::PopUp,
+                    is_resizable: false,
+                    ..Default::default()
+                },
+                |window, cx| {
+                    if let Some(hwnd) = native_window(window) {
+                        logger::log_info(&format!("数值调节浮窗 HWND={}", hwnd.0 as isize));
+                        unsafe {
+                            use windows::Win32::UI::WindowsAndMessaging::*;
+                            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+                            SetWindowLongPtrW(hwnd, GWL_STYLE, style | WS_POPUP.0 as isize);
+                            let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                            SetWindowLongPtrW(
+                                hwnd,
+                                GWL_EXSTYLE,
+                                ex_style | WS_EX_TOOLWINDOW.0 as isize,
+                            );
+                            if let Some(owner) = owner {
+                                SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner.0 as isize);
+                            }
+                            let _ = SetWindowPos(
+                                hwnd,
+                                Some(HWND_TOPMOST),
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+                            );
+                        }
+                    }
+                    let popup_storage = popup_storage_close.clone();
+                    window.on_window_should_close(cx, move |_window, _cx| {
+                        *popup_storage.lock() = None;
+                        true
+                    });
+
+                    let popup_storage_for_close = popup_storage_close.clone();
+                    let popup_storage_for_toolbox = popup_storage_close.clone();
+
+                    let view = cx.new(|cx| {
+                        TrayValuePopupView::new(
+                            app_state_clone,
+                            param,
+                            cx,
+                            Some(Box::new(move |window, cx| {
+                                *popup_storage_for_toolbox.lock() = None;
+                                window.remove_window();
+                                let cb = open_main_cb.lock();
+                                cb(cx);
+                            })),
+                            Some(Box::new(move |window, _cx| {
+                                *popup_storage_for_close.lock() = None;
+                                window.remove_window();
+                            })),
+                        )
+                    });
+
+                    window.focus(&view.read(cx).focus_handle);
+                    view
+                },
+            );
+
+            if let Ok(w) = win {
+                logger::log_info("已创建数值调节浮窗");
+                let _ = w.update(cx, |_, window, _| window.activate_window());
+                *value_popup_storage.lock() = Some(w.into());
+                *value_popup_focus_tracker.lock() = (false, std::time::Instant::now());
+            }
+        };
+
         // 如果启动参数包含 --open-brightness，直接打开托盘亮度面板
         if is_open_brightness {
             toggle_tray_popup(cx);
@@ -1549,6 +1961,7 @@ fn main() {
         let tray_pump = tray_manager.clone();
         let app_state_pump = app_state.clone();
         let toggle_popup_for_pump = Arc::new(Mutex::new(toggle_tray_popup));
+        let open_value_popup_for_pump = Arc::new(Mutex::new(open_value_popup));
         let open_main_for_pump = open_main_window_for_tray.clone();
 
         let async_cx = cx.to_async();
@@ -1557,6 +1970,12 @@ fn main() {
         cx.foreground_executor()
             .spawn(async move {
                 loop {
+                    if instance.take_main() {
+                        let _ = async_cx.update(|cx| (open_main_for_pump.lock())(cx));
+                    }
+                    if instance.take_brightness() {
+                        let _ = async_cx.update(|cx| (toggle_popup_for_pump.lock())(cx));
+                    }
                     // 0. 托盘面板失焦自动关闭检查（失焦关闭并清空 storage，下次点击立即可重新打开）
                     let popup_handle_opt = {
                         let guard = tray_popup_handle.lock();
@@ -1586,8 +2005,37 @@ fn main() {
                         });
                     }
 
+                    let value_popup_handle_opt = {
+                        let guard = value_popup_handle.lock();
+                        *guard
+                    };
+                    if let Some(val_popup_h) = value_popup_handle_opt {
+                        let _ = async_cx.update(|cx| {
+                            let active_res =
+                                val_popup_h.update(cx, |_, window, _| window.is_window_active());
+                            match active_res {
+                                Ok(is_active) => {
+                                    let mut focus_state = value_popup_focus_state.lock();
+                                    if is_active {
+                                        focus_state.0 = true;
+                                    } else if focus_state.1.elapsed() > Duration::from_millis(700) {
+                                        logger::log_info("数值调节浮窗失焦关闭");
+                                        let _ = val_popup_h.update(cx, |_, window, _| {
+                                            window.remove_window();
+                                        });
+                                        *value_popup_handle.lock() = None;
+                                    }
+                                }
+                                Err(_) => {
+                                    *value_popup_handle.lock() = None;
+                                }
+                            }
+                        });
+                    }
+
                     // 1. 处理后台业务事件
-                    while let Some(evt) = bus_pump.try_recv_event() {
+                    for _ in 0..64 {
+                        let Some(evt) = bus_pump.try_recv_event() else { break; };
                         if matches!(evt, AppEvent::OpenBrightness) {
                             let _ = async_cx.update(|cx| (toggle_popup_for_pump.lock())(cx));
                             continue;
@@ -1607,7 +2055,7 @@ fn main() {
                                             return;
                                         }
                                     }
-                                    let origin = get_tray_popup_origin();
+                                    let origin = get_tray_popup_origin_with_size(320.0, 130.0);
                                     let bus = bus_pump.clone();
                                     let message = message.clone();
                                     if let Ok(handle) = cx.open_window(
@@ -1635,9 +2083,18 @@ fn main() {
                             });
                             continue;
                         }
+                        if matches!(evt, AppEvent::AdbStateChanged { .. }) {
+                            let _ = async_cx.update(|cx| {
+                                let view = app_state_pump.read(cx).preset_view.clone();
+                                if let Some(view) = view {
+                                    view.update(cx, |view, cx| view.handle_event(&evt, cx));
+                                }
+                            });
+                        }
                         if matches!(
                             evt,
                             AppEvent::PresetSnapshotCaptured { .. }
+                                | AppEvent::PresetConfigResult { .. }
                                 | AppEvent::PresetApplied { .. }
                                 | AppEvent::BaselineRestored { .. }
                                 | AppEvent::PresetOperationFailed { .. }
@@ -1652,6 +2109,16 @@ fn main() {
                         }
                         let _ = async_cx.update(|cx| {
                             app_state_pump.update(cx, |st, cx| match evt {
+                                AppEvent::TrayValueResult { request_id, generation, error } => {
+                                    if generation == bus_pump.active_generation.load(Ordering::Acquire) {
+                                        st.tray_value_results.retain(|_, (epoch, _)| *epoch == generation);
+                                        st.tray_value_results.insert(request_id, (generation, error));
+                                        while st.tray_value_results.len() > 128 {
+                                            st.tray_value_results.pop_first();
+                                        }
+                                        cx.notify();
+                                    }
+                                }
                                 AppEvent::GuardianStatusUpdated { status, generation } => {
                                     if generation
                                         == bus_pump.active_generation.load(Ordering::Acquire)
@@ -1693,7 +2160,7 @@ fn main() {
                                                 Some((format!("ADB 连接失败：{message}"), true));
                                         }
                                         st.tools_page.update(cx, |view, cx| {
-                                            view.set_connected(is_connected, generation, cx)
+                                            view.set_connected(is_connected, generation, Some(&ip), cx)
                                         });
                                         st.picture_page.update(cx, |page, cx| {
                                             page.advanced.update(cx, |view, cx| {
@@ -1931,11 +2398,19 @@ fn main() {
                                     if generation
                                         == bus_pump.current_scan_generation.load(Ordering::Relaxed)
                                     {
+                                        let completed_by_user_scan = st.is_adb_scanning;
                                         st.is_adb_scanning = false;
-                                        st.toast = Some((
-                                            format!("扫描完成，共发现 {} 台设备", found_count),
-                                            false,
-                                        ));
+                                        if completed_by_user_scan && !st.adb_state.is_connected() && !st.is_adb_connecting {
+                                            if let Some(ip) = single_scan_target(&st.discovered_devices) {
+                                                st.connect_ip(&ip, cx);
+                                            } else {
+                                                st.toast = Some((if found_count == 0 {
+                                                    "未发现显示器，请检查显示器与电脑是否连接同一网络".into()
+                                                } else {
+                                                    format!("发现 {found_count} 台设备，点击要连接的显示器")
+                                                }, found_count == 0));
+                                            }
+                                        }
                                         cx.notify();
                                     }
                                 }
@@ -2120,6 +2595,7 @@ fn main() {
                                     }
                                 }
                                 AppEvent::PresetSnapshotCaptured { .. }
+                                | AppEvent::PresetConfigResult { .. }
                                 | AppEvent::PresetApplied { .. }
                                 | AppEvent::BaselineRestored { .. }
                                 | AppEvent::PresetOperationFailed { .. } => {
@@ -2143,6 +2619,10 @@ fn main() {
                             TrayEvent::ToggleBrightnessPanel => {
                                 let cb = toggle_popup_for_pump.lock();
                                 cb(cx);
+                            }
+                            TrayEvent::OpenValueSlider(param) => {
+                                let cb = open_value_popup_for_pump.lock();
+                                cb(param, cx);
                             }
                             TrayEvent::RefreshMonitors => {
                                 let _ = bus_pump.cmd_sender.send(AppCommand::RefreshMonitors);

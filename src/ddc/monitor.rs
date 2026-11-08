@@ -109,6 +109,7 @@ impl Drop for PhysicalMonitorsGuard {
 pub trait DdcHardwareAdapter: Send + Sync {
     fn list_displays(&self) -> Vec<RawDisplayItem>;
     fn get_gdi_monitor(&self, device_name: &str) -> Option<HMONITOR>;
+    fn gdi_snapshot(&self) -> Option<HashMap<String, HMONITOR>> { None }
     fn get_physical_monitors_count(&self, h_mon: HMONITOR) -> Option<u32>;
     fn open_physical_monitors(
         &self,
@@ -128,6 +129,9 @@ fn wide_null_terminated(slice: &[u16]) -> String {
 pub struct Win32DdcAdapter;
 
 impl DdcHardwareAdapter for Win32DdcAdapter {
+    fn gdi_snapshot(&self) -> Option<HashMap<String, HMONITOR>> {
+        Some(enumerate_gdi_monitors())
+    }
     fn list_displays(&self) -> Vec<RawDisplayItem> {
         let mut displays = Vec::new();
         let mut adapter_index: u32 = 0;
@@ -359,6 +363,7 @@ pub fn enumerate_ddc_monitors_with_adapter(
     adapter: &dyn DdcHardwareAdapter,
 ) -> Vec<DdcMonitorInfo> {
     let displays = adapter.list_displays();
+    let gdi = adapter.gdi_snapshot();
     let mut result = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
 
@@ -394,7 +399,11 @@ pub fn enumerate_ddc_monitors_with_adapter(
             continue;
         }
 
-        let h_mon = match adapter.get_gdi_monitor(&disp.device_name) {
+        let handle = match &gdi {
+            Some(map) => map.get(&disp.device_name).copied(),
+            None => adapter.get_gdi_monitor(&disp.device_name),
+        };
+        let h_mon = match handle {
             Some(h) => h,
             None => continue,
         };

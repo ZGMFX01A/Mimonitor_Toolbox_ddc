@@ -116,7 +116,7 @@ impl GlobalHotkeyManager {
                 let mut dummy_msg = MSG::default();
                 let _ = PeekMessageW(&mut dummy_msg, None, 0, 0, PM_NOREMOVE);
                 let tid = GetCurrentThreadId();
-                let _ = ready_tx.send(tid);
+                if ready_tx.send(tid).is_err() { return; }
             }
 
             run_worker_message_loop(cmd_rx, event_tx_clone);

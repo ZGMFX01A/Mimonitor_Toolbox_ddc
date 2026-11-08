@@ -238,27 +238,15 @@ pub enum HotkeyModifier {
 
 impl HotkeyModifier {
     pub fn parse(s: &str) -> Option<Self> {
-        let trimmed = s.trim();
-        if trimmed.is_empty() || trimmed == "无" || trimmed.eq_ignore_ascii_case("none") {
-            Some(HotkeyModifier::None)
-        } else if trimmed.eq_ignore_ascii_case("Ctrl + Alt")
-            || trimmed.eq_ignore_ascii_case("Alt + Ctrl")
-        {
-            Some(HotkeyModifier::CtrlAlt)
-        } else if trimmed.eq_ignore_ascii_case("Ctrl + Shift")
-            || trimmed.eq_ignore_ascii_case("Shift + Ctrl")
-        {
-            Some(HotkeyModifier::CtrlShift)
-        } else if trimmed.eq_ignore_ascii_case("Alt + Shift")
-            || trimmed.eq_ignore_ascii_case("Shift + Alt")
-        {
-            Some(HotkeyModifier::AltShift)
-        } else if trimmed.eq_ignore_ascii_case("Win + Shift")
-            || trimmed.eq_ignore_ascii_case("Shift + Win")
-        {
-            Some(HotkeyModifier::WinShift)
-        } else {
-            None
+        // Accept the form's Ctrl+Alt examples and legacy Ctrl + Alt settings.
+        let normalized = s.split('+').map(str::trim).collect::<Vec<_>>().join("+").to_ascii_lowercase();
+        match normalized.as_str() {
+            "" | "无" | "none" => Some(Self::None),
+            "ctrl+alt" | "alt+ctrl" => Some(Self::CtrlAlt),
+            "ctrl+shift" | "shift+ctrl" => Some(Self::CtrlShift),
+            "alt+shift" | "shift+alt" => Some(Self::AltShift),
+            "win+shift" | "shift+win" => Some(Self::WinShift),
+            _ => None,
         }
     }
 

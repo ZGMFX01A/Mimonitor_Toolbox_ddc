@@ -5,3 +5,4 @@
 /.agy-staff
 *.pdb
 **/*.rs.bk
+/docs/

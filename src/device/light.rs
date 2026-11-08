@@ -1,7 +1,7 @@
 use crate::adb::commands::build_tvservice_app_process_command;
 use crate::adb::{AdbDevice, AdbError};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub const COLORFUL_LED_TOOL_JAR: &str = "ColorfulLedTool.jar";
 pub const REMOTE_CACHE_DIR: &str = "/data/data/mitv.service/cache";
@@ -177,30 +177,7 @@ pub fn read_screen_light_state(adb: &AdbDevice) -> ScreenLightState {
 
 /// 定位本地 ColorfulLedTool.jar
 pub fn get_local_colorful_led_tool_path() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let p = parent
-                .join("assets")
-                .join("runtime")
-                .join(COLORFUL_LED_TOOL_JAR);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    let p = Path::new("assets")
-        .join("runtime")
-        .join(COLORFUL_LED_TOOL_JAR);
-    if p.exists() {
-        return Some(p);
-    }
-    let persistent_p = crate::config::get_app_data_dir()
-        .join("runtime")
-        .join(COLORFUL_LED_TOOL_JAR);
-    if persistent_p.exists() {
-        return Some(persistent_p);
-    }
-    None
+    crate::resources::helper_path(COLORFUL_LED_TOOL_JAR)
 }
 
 /// 检查并修复设备端的 ColorfulLedTool.jar

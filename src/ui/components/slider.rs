@@ -275,10 +275,15 @@ impl Render for ContinuousSlider {
             ),
         };
 
-        let label_text = if let Some(ref reason) = self.disabled_reason {
-            format!("{} ({})", self.label, reason)
+        let thumb_size = px(14.0);
+        let thumb_left = if let Some(bounds) = self.last_bounds {
+            if bounds.size.width > thumb_size {
+                (bounds.size.width - thumb_size) * fraction
+            } else {
+                px(0.0)
+            }
         } else {
-            self.label.clone()
+            px(0.0)
         };
 
         div()
@@ -296,19 +301,34 @@ impl Render for ContinuousSlider {
                     .flex_row()
                     .justify_between()
                     .items_center()
-                    .text_xs()
                     .child(
                         div()
-                            .text_color(rgb(if is_disabled {
-                                ThemeColors::TEXT_DISABLED()
-                            } else {
-                                ThemeColors::TEXT_SECONDARY()
-                            }))
-                            .child(label_text),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_1_5()
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(if is_disabled {
+                                        ThemeColors::TEXT_DISABLED()
+                                    } else {
+                                        ThemeColors::TEXT_PRIMARY()
+                                    }))
+                                    .child(self.label.clone()),
+                            )
+                            .children(self.disabled_reason.as_ref().map(|reason| {
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(ThemeColors::TEXT_MUTED()))
+                                    .child(format!("({})", reason))
+                            })),
                     )
                     .child(
                         div()
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(rgb(if is_disabled {
                                 ThemeColors::TEXT_DISABLED()
                             } else if self.value.is_none() {
@@ -319,14 +339,14 @@ impl Render for ContinuousSlider {
                             .child(display_val),
                     ),
             )
-            // 可拖拽的滑块轨道容器
+            // 可拖拽的滑块轨道容器（高度适度加宽至28px提升命中率，不改数据映射）
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .w_full()
-                    .h(px(24.0))
+                    .h(px(28.0))
                     .cursor(if is_disabled {
                         CursorStyle::Arrow
                     } else {
@@ -361,19 +381,23 @@ impl Render for ContinuousSlider {
                                     }))
                                     .rounded_full(),
                             )
-                            // 滑块拇指 Thumb (仅在有确定数值且未禁用时显示在对应位置)
+                            // 滑块拇指 Thumb (仅在有确定数值且未禁用时显示在对应位置，居中且两端不溢出)
                             .children(if !is_disabled && self.value.is_some() {
                                 Some(
                                     div()
                                         .absolute()
                                         .top(px(-4.0))
-                                        .left(gpui::DefiniteLength::Fraction(fraction))
-                                        .w(px(14.0))
-                                        .h(px(14.0))
+                                        .left(thumb_left)
+                                        .w(thumb_size)
+                                        .h(thumb_size)
                                         .rounded_full()
                                         .bg(rgb(0xFFFFFF))
                                         .border_2()
-                                        .border_color(rgb(ThemeColors::ACCENT_CYAN())),
+                                        .border_color(rgb(if self.is_dragging {
+                                            ThemeColors::ACCENT_HOVER()
+                                        } else {
+                                            ThemeColors::ACCENT_CYAN()
+                                        })),
                                 )
                             } else {
                                 None

@@ -9,9 +9,33 @@ use std::sync::{
     Arc,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub static GAME_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Serializes a session transition with a configuration commit from that session.
+pub struct SessionGeneration {
+    value: AtomicU64,
+    commit_gate: Mutex<()>,
+}
+impl SessionGeneration {
+    fn new(value: u64) -> Self {
+        Self { value: AtomicU64::new(value), commit_gate: Mutex::new(()) }
+    }
+    pub fn load(&self, order: Ordering) -> u64 { self.value.load(order) }
+    pub fn store(&self, value: u64, order: Ordering) {
+        let _guard = self.commit_gate.lock();
+        self.value.store(value, order);
+    }
+    pub fn fetch_add(&self, value: u64, order: Ordering) -> u64 {
+        let _guard = self.commit_gate.lock();
+        self.value.fetch_add(value, order)
+    }
+    pub fn with_current<T>(&self, generation: u64, commit: impl FnOnce() -> T) -> Option<T> {
+        let _guard = self.commit_gate.lock();
+        (self.value.load(Ordering::Acquire) == generation).then(commit)
+    }
+}
 fn is_game(command: &AppCommand) -> bool {
     use AppCommand::*;
     matches!(
@@ -29,6 +53,7 @@ fn is_game(command: &AppCommand) -> bool {
             | SwitchGameModeAndApply { .. }
     )
 }
+#[derive(Clone)]
 struct Envelope {
     command: AppCommand,
     token: Option<Arc<AtomicBool>>,
@@ -37,6 +62,7 @@ struct Envelope {
 }
 #[derive(Default)]
 struct Inbox {
+    events: Option<Sender<AppEvent>>,
     queue: Mutex<VecDeque<Envelope>>,
     changed: Condvar,
     closed: AtomicBool,
@@ -53,7 +79,16 @@ impl Inbox {
                 .iter()
                 .position(|old| coalesce_key(&old.command).as_ref() == Some(&key))
             {
-                q.remove(index);
+                if let Some(Envelope {
+                    command: AppCommand::TrayValueCommit { request_id, generation, .. }, ..
+                }) = q.remove(index) {
+                    if let Some(events) = &self.events {
+                        let _ = events.send(AppEvent::TrayValueResult {
+                            request_id, generation,
+                            error: Some("此操作已被更新的设置替代".into()),
+                        });
+                    }
+                }
             }
         }
         if q.len() >= 128 {
@@ -82,6 +117,7 @@ impl Inbox {
     }
     fn receive_timed(&self) -> Option<Envelope> {
         let mut q = self.queue.lock();
+        let deadline = Instant::now() + Duration::from_millis(500);
         if q.is_empty() && !self.closed.load(Ordering::Acquire) {
             self.changed.wait_for(&mut q, Duration::from_millis(100));
         }
@@ -95,7 +131,9 @@ impl Inbox {
                 .lock()
                 .map(|t| Duration::from_millis(180).saturating_sub(t.elapsed()))
                 .unwrap_or_default();
-            if remaining.is_zero() {
+            let remaining = remaining.min(deadline.saturating_duration_since(Instant::now()));
+            if remaining.is_zero() || q.iter().any(|e| matches!(e.command,
+                AppCommand::ConnectAdb { .. } | AppCommand::DisconnectAdb | AppCommand::CancelConnection { .. })) {
                 break;
             }
             self.changed.wait_for(&mut q, remaining);
@@ -111,6 +149,11 @@ fn coalesce_key(command: &AppCommand) -> Option<String> {
     use AppCommand::*;
     Some(match command {
         SetBacklight { generation, .. } => format!("backlight:{generation}"),
+        HotkeyCommit {
+            param, generation, ..
+        } | TrayValueCommit {
+            param, generation, ..
+        } => format!("hotkey_commit:{generation}:{param:?}"),
         SetPictureSlider {
             param, generation, ..
         } => format!("picture:{generation}:{param:?}"),
@@ -133,7 +176,8 @@ fn coalesce_key(command: &AppCommand) -> Option<String> {
 fn generation(command: &AppCommand) -> Option<u64> {
     use AppCommand::*;
     match command {
-        HotkeyCommit { generation, .. }
+        TrayValueCommit { generation, .. }
+        | HotkeyCommit { generation, .. }
         | Hotkey { generation, .. }
         | ConnectAdb { generation, .. }
         | CancelConnection { generation }
@@ -175,7 +219,7 @@ pub struct CommandSender {
     scan: Arc<Inbox>,
     active_connect_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     active_scan_cancel: Arc<Mutex<Option<Arc<AtomicBool>>>>,
-    active_generation: Arc<AtomicU64>,
+    active_generation: Arc<SessionGeneration>,
     current_scan_generation: Arc<AtomicU64>,
     connect_cancel_token: Arc<AtomicBool>,
     scan_cancel_token: Arc<AtomicBool>,
@@ -243,6 +287,10 @@ impl CommandSender {
                 param: crate::hotkey::AdjustParam::Backlight,
                 ..
             }
+            | AppCommand::TrayValueCommit {
+                param: crate::hotkey::AdjustParam::Backlight,
+                ..
+            }
             | AppCommand::SetBacklight { .. }
             | AppCommand::SetPictureSlider {
                 param: crate::device::picture::PictureSliderParam::Backlight,
@@ -278,7 +326,7 @@ pub struct MessageBus {
     pub cmd_sender: CommandSender,
     pub event_sender: Sender<AppEvent>,
     event_receiver: Arc<Mutex<Receiver<AppEvent>>>,
-    pub active_generation: Arc<AtomicU64>,
+    pub active_generation: Arc<SessionGeneration>,
     pub current_scan_generation: Arc<AtomicU64>,
     pub light_revision: Arc<AtomicU64>,
     pub connect_cancel_token: Arc<AtomicBool>,
@@ -296,7 +344,7 @@ impl Default for MessageBus {
 impl MessageBus {
     pub fn new() -> Self {
         let (tx, rx) = channel();
-        let adb = Arc::new(Inbox::default());
+        let adb = Arc::new(Inbox { events: Some(tx.clone()), ..Inbox::default() });
         let ddc = Arc::new(Inbox::default());
         let scan = Arc::new(Inbox::default());
         let sender = CommandSender {
@@ -305,7 +353,7 @@ impl MessageBus {
             scan: scan.clone(),
             active_connect_cancel: Arc::new(Mutex::new(None)),
             active_scan_cancel: Arc::new(Mutex::new(None)),
-            active_generation: Arc::new(AtomicU64::new(1)),
+            active_generation: Arc::new(SessionGeneration::new(1)),
             current_scan_generation: Arc::new(AtomicU64::new(1)),
             connect_cancel_token: Arc::new(AtomicBool::new(false)),
             scan_cancel_token: Arc::new(AtomicBool::new(false)),
@@ -438,27 +486,140 @@ impl MessageBus {
     }
 }
 
+fn connection_retry_delay(error: &crate::adb::AdbError, retries: u8) -> Option<Duration> {
+    use crate::adb::AdbError::*;
+    if retries >= 6 || !matches!(error,
+        NetworkUnreachable(_) | PortClosed(_) | HandshakeFailed(_) | DeviceOffline | NotFound) {
+        return None;
+    }
+    Some(Duration::from_secs((2u64 << retries).min(30)))
+}
+
 fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
     let mut device: Option<AdbDevice> = None;
     let mut scheduler = super::scheduler::SchedulerEngine::new();
     let mut shortcuts = super::shortcuts::Shortcuts::new();
     let mut hdr = crate::device::hdr::HdrMemory::new();
+    let mut preset_sync = super::preset_sync::PresetSyncDebouncer::new();
+    let mut retry: Option<(Instant, Envelope, u8)> = None;
+    let mut session: Option<Envelope> = None;
+    let mut last_health_check = Instant::now();
+    let mut last_background = Instant::now();
     loop {
         if bus.is_shutdown.load(Ordering::Acquire) {
             break;
         }
         shortcuts.tick(device.as_ref(), &bus);
-        let Some(env) = inbox.receive_timed() else {
-            scheduler.tick(device.as_ref(), &bus);
-            hdr.tick(device.as_ref(), &bus);
-            continue;
+        // Time-based task transitions must also run when commands keep arriving.
+        scheduler.tick(device.as_ref(), &bus);
+        if last_health_check.elapsed() >= Duration::from_secs(5) {
+            last_health_check = Instant::now();
+            if let (Some(dev), Some(current)) = (device.as_ref(), session.as_ref()) {
+                let live = bus.active_generation.load(Ordering::Acquire);
+                if current.dispatch_generation == live && !current.token.as_ref().unwrap().load(Ordering::Acquire) {
+                    let state = dev.get_state_with_cancel(Duration::from_secs(1), current.token.as_deref());
+                    if !state.is_connected() {
+                        let _ = dev.disconnect();
+                        let _ = bus.event_sender.send(AppEvent::AdbStateChanged {
+                            ip: dev.ip.clone(), state: state.clone(), model: String::new(), generation: live,
+                        });
+                        if state != AdbDeviceState::Unauthorized {
+                            retry = Some((Instant::now() + Duration::from_secs(2), current.clone(), 1));
+                        }
+                        device = None;
+                        preset_sync.clear();
+                    }
+                }
+            }
+        }
+        if retry.as_ref().is_some_and(|(_, env, _)|
+            env.dispatch_generation != bus.active_generation.load(Ordering::Acquire)
+            || env.token.as_ref().unwrap().load(Ordering::Acquire)) {
+            retry = None;
+        }
+        let (next, retry_count) = if retry.as_ref().is_some_and(|(due, _, _)| Instant::now() >= *due) {
+            let (_, env, count) = retry.take().unwrap();
+            (Some(env), count)
+        } else {
+            (inbox.receive_timed(), 0)
         };
+        if next.is_none() || last_background.elapsed() >= Duration::from_secs(2) {
+            last_background = Instant::now();
+            hdr.tick(device.as_ref(), &bus);
+            if let Some(dev) = device.as_ref() {
+                if !scheduler.is_active_or_pending_restore() {
+                    let live_gen = bus.active_generation.load(Ordering::Acquire);
+                    let cfg = crate::config::load_settings();
+                    let active_id = cfg.active_preset_id.as_deref();
+                    if let Some(target_id) = preset_sync.take_due(live_gen, active_id, Instant::now()) {
+                        if let Some(preset_name) =
+                            cfg.presets.iter().find(|p| p.id == target_id).map(|p| p.name.clone())
+                        {
+                            match crate::presets::capture_hardware_snapshot(dev) {
+                                Ok(values) if !values.is_empty()
+                                    && live_gen == bus.active_generation.load(Ordering::Acquire) => {
+                                    let mut applied = false;
+                                    let saved = bus.active_generation.with_current(live_gen, || crate::config::update_settings(|cfg| {
+                                        applied = super::preset_sync::apply_preset_values_to_config(
+                                            cfg,
+                                            &target_id,
+                                            values,
+                                        );
+                                    }));
+                                    match saved {
+                                        None => {},
+                                        Some(Ok(updated)) => {
+                                            if applied {
+                                                let _ = bus
+                                                    .event_sender
+                                                    .send(AppEvent::ConfigUpdated((*updated).clone()));
+                                                let _ = bus.event_sender.send(AppEvent::ToastNotification {
+                                                    message: format!("预设「{}」已自动同步", preset_name),
+                                                    is_error: false,
+                                                });
+                                            }
+                                        }
+                                        Some(Err(err)) => {
+                                            crate::logger::log_preset(&format!(
+                                                "自动同步预设「{preset_name}」配置保存失败：{err}"
+                                            ));
+                                            let _ = bus.event_sender.send(AppEvent::ToastNotification {
+                                                message: format!("预设「{preset_name}」自动保存失败：{err}"),
+                                                is_error: true,
+                                            });
+                                        }
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    crate::logger::log_preset(&format!(
+                                        "自动同步预设「{preset_name}」硬件回读失败：{err}"
+                                    ));
+                                    if live_gen == bus.active_generation.load(Ordering::Acquire) {
+                                        let _ = bus.event_sender.send(AppEvent::ToastNotification {
+                                            message: format!("预设「{preset_name}」未自动保存，设备回读失败：{err}"),
+                                            is_error: true,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    preset_sync.clear();
+                }
+            } else {
+                preset_sync.clear();
+            }
+        }
+        let Some(env) = next else { continue; };
         if matches!(env.command, AppCommand::ConfirmTaskRestore(_))
             && env.dispatch_generation != bus.active_generation.load(Ordering::Acquire)
         {
             continue;
         }
         if scheduler.edit(&env.command, &bus, device.as_ref()) {
+            preset_sync.clear();
             continue;
         }
         let live = bus.active_generation.load(Ordering::Acquire);
@@ -475,7 +636,45 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
             }
         }
         match &env.command {
-            AppCommand::CancelHotkey => shortcuts.cancel(&bus),
+            AppCommand::EditPresetConfig { mutation, request_id } => {
+                let save = || {
+                    let mut result = Ok(());
+                    let saved = crate::config::update_settings(|cfg| result = mutation.apply(cfg));
+                    saved.map_err(|error| error.to_string()).and_then(|cfg| result.map(|()| cfg))
+                };
+                let saved = match mutation.generation() {
+                    Some(generation) => bus.active_generation.with_current(generation, save),
+                    None => Some(save()),
+                };
+                match saved {
+                    Some(Ok(config)) => {
+                        let _ = bus.event_sender.send(AppEvent::ConfigUpdated((*config).clone()));
+                        let _ = bus.event_sender.send(AppEvent::PresetConfigResult {
+                            request_id: *request_id, mutation: mutation.clone(), error: None,
+                        });
+                    }
+                    Some(Err(error)) => {
+                        let _ = bus.event_sender.send(AppEvent::ConfigUpdated((*crate::config::load_settings()).clone()));
+                        let _ = bus.event_sender.send(AppEvent::ToastNotification {
+                            message: format!("保存预设失败：{error}"), is_error: true,
+                        });
+                        let _ = bus.event_sender.send(AppEvent::PresetConfigResult {
+                            request_id: *request_id, mutation: mutation.clone(), error: Some(error),
+                        });
+                    }
+                    None => {
+                        let _ = bus.event_sender.send(AppEvent::ConfigUpdated((*crate::config::load_settings()).clone()));
+                        let _ = bus.event_sender.send(AppEvent::PresetConfigResult {
+                            request_id: *request_id, mutation: mutation.clone(),
+                            error: Some("连接已改变，预设保存已取消".into()),
+                        });
+                    }
+                }
+            }
+            AppCommand::CancelHotkey => {
+                shortcuts.cancel(&bus);
+                preset_sync.clear();
+            }
             AppCommand::Hotkey { event, .. } => {
                 let result = device
                     .as_ref()
@@ -489,28 +688,36 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
                 }
             }
             AppCommand::ConnectAdb { ip, generation } => {
-                device = None;
-                let token = env.token.unwrap();
+                preset_sync.clear();
+                retry = None;
+                if let Some(old) = device.take() {
+                    let _ = old.disconnect();
+                }
+                let token = env.token.as_ref().unwrap().clone();
                 if token.load(Ordering::Acquire) {
                     continue;
                 }
+                session = Some(env.clone());
                 let dev = AdbDevice::new(ip.clone()).with_session_cancel(token.clone());
                 let result =
                     dev.connect_transaction(Duration::from_secs(12), 3, true, Some(&token));
                 if *generation != bus.active_generation.load(Ordering::Acquire)
                     || token.load(Ordering::Acquire)
                 {
+                    let _ = dev.disconnect();
                     continue;
                 }
                 match result {
                     Ok(model) => {
-                        device = Some(dev.clone());
                         let heal = crate::device::jni::check_and_heal_jar(&dev);
                         if *generation != bus.active_generation.load(Ordering::Acquire)
                             || token.load(Ordering::Acquire)
                         {
+                            let _ = dev.disconnect();
                             continue;
                         }
+                        device = Some(dev.clone());
+                        last_health_check = Instant::now();
                         if let Err(error) = heal {
                             let _ = bus.event_sender.send(AppEvent::ToastNotification {
                                 message: format!("JNI 工具部署失败：{error}"),
@@ -531,6 +738,10 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
                         });
                     }
                     Err(error) => {
+                        let _ = dev.disconnect();
+                        if let Some(delay) = connection_retry_delay(&error, retry_count) {
+                            retry = Some((Instant::now() + delay, env.clone(), retry_count + 1));
+                        }
                         crate::logger::log_adb(&format!("连接 {ip} 失败：{error}"));
                         let _ = bus.event_sender.send(AppEvent::AdbStateChanged {
                             ip: ip.clone(),
@@ -542,7 +753,12 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
                 }
             }
             AppCommand::DisconnectAdb | AppCommand::CancelConnection { .. } => {
-                device = None;
+                preset_sync.clear();
+                retry = None;
+                session = None;
+                if let Some(old) = device.take() {
+                    let _ = old.disconnect();
+                }
                 let _ = bus.event_sender.send(AppEvent::AdbStateChanged {
                     ip: String::new(),
                     state: AdbDeviceState::NotFound,
@@ -563,6 +779,34 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
                 } else {
                     Err("设备未连接，请先连接显示器".into())
                 };
+                if let AppCommand::TrayValueCommit { request_id, generation, .. } = &env.command {
+                    let _ = bus.event_sender.send(AppEvent::TrayValueResult {
+                        request_id: *request_id, generation: *generation,
+                        error: result.as_ref().err().cloned(),
+                    });
+                }
+                if matches!(
+                    env.command,
+                    AppCommand::ApplyPreset { .. } | AppCommand::RestoreBaseline { .. }
+                ) {
+                    preset_sync.clear();
+                } else if result.is_ok()
+                    && super::preset_sync::is_manual_picture_change(&env.command)
+                    && !scheduler.is_active_or_pending_restore()
+                    && generation(&env.command) == Some(bus.active_generation.load(Ordering::Acquire))
+                {
+                    let cfg = crate::config::load_settings();
+                    let live_gen = live;
+                    if let Some(active_id) = cfg.active_preset_id.as_deref() {
+                        if cfg.presets.iter().any(|p| p.id == active_id) {
+                            preset_sync.note(Some(active_id), live_gen, Instant::now());
+                        } else {
+                            preset_sync.clear();
+                        }
+                    } else {
+                        preset_sync.clear();
+                    }
+                }
                 // Keep a quiet interval between transactions so rapid clicks cannot flood firmware.
                 std::thread::sleep(Duration::from_millis(250));
                 let _ = bus.event_sender.send(AppEvent::DeviceActivity {
@@ -664,6 +908,9 @@ fn execute(
     let tx = &bus.event_sender;
     let fail = |e: crate::adb::AdbError| e.to_string();
     match command {
+        TrayValueCommit { param, value, generation, .. } => {
+            return execute(dev, &HotkeyCommit { param: *param, value: *value, generation: *generation }, bus, read_revision);
+        }
         HotkeyCommit {
             param,
             value,
@@ -722,6 +969,14 @@ fn execute(
                     }
                 }
             };
+            if let SetPictureSlider { param, value, .. } = &next {
+                dev.transaction(|| p::set_picture_slider_param(dev, *param, *value)).map_err(fail)?;
+                let _ = bus.cmd_sender.send(FetchPictureParameters { generation: gen });
+                if *param == p::PictureSliderParam::Backlight {
+                    let _ = bus.cmd_sender.send(FetchBacklight { generation: gen });
+                }
+                return Ok(());
+            }
             return execute(dev, &next, bus, read_revision);
         }
         FetchBacklight { .. } => {
@@ -1091,6 +1346,84 @@ fn execute(
 mod tests {
     use super::*;
     #[test]
+    fn connection_recovery_is_bounded_and_stops_for_authorization_or_cancel() {
+        use crate::adb::AdbError::*;
+        assert_eq!(connection_retry_delay(&NetworkUnreachable("wifi".into()), 0), Some(Duration::from_secs(2)));
+        assert_eq!(connection_retry_delay(&DeviceOffline, 5), Some(Duration::from_secs(30)));
+        assert_eq!(connection_retry_delay(&DeviceOffline, 6), None);
+        assert_eq!(connection_retry_delay(&Unauthorized, 0), None);
+        assert_eq!(connection_retry_delay(&Cancelled, 0), None);
+        assert_eq!(connection_retry_delay(&ServerNotReady("foreign owner".into()), 0), None);
+    }
+
+    #[test]
+    fn continuous_updates_cannot_starve_the_first_write() {
+        let inbox = Arc::new(Inbox::default());
+        let message = Envelope {
+            command: AppCommand::SetBacklight { value: 20, generation: 1 },
+            token: None, revision: 0, dispatch_generation: 1,
+        };
+        inbox.push(message.clone()).unwrap();
+        let producer_inbox = inbox.clone();
+        let producer = thread::spawn(move || {
+            for _ in 0..15 {
+                thread::sleep(Duration::from_millis(80));
+                producer_inbox.push(message.clone()).unwrap();
+            }
+        });
+        let start = Instant::now();
+        assert!(inbox.receive_timed().is_some());
+        let elapsed = start.elapsed();
+        producer.join().unwrap();
+        assert!(elapsed < Duration::from_millis(900), "debounce starved for {elapsed:?}");
+    }
+
+    #[test]
+    fn session_transition_waits_for_current_commit() {
+        let generation = Arc::new(SessionGeneration::new(1));
+        let (requested_tx, requested_rx) = channel();
+        let (finished_tx, finished_rx) = channel();
+        let mut transition = None;
+        assert_eq!(generation.with_current(1, || {
+            let other = generation.clone();
+            transition = Some(thread::spawn(move || {
+                requested_tx.send(()).unwrap();
+                other.fetch_add(1, Ordering::AcqRel);
+                finished_tx.send(()).unwrap();
+            }));
+            requested_rx.recv().unwrap();
+            assert!(finished_rx.try_recv().is_err());
+            assert_eq!(generation.load(Ordering::Acquire), 1);
+            "committed"
+        }), Some("committed"));
+        transition.unwrap().join().unwrap();
+        finished_rx.recv().unwrap();
+        assert_eq!(generation.load(Ordering::Acquire), 2);
+        assert_eq!(generation.with_current(1, || "stale write"), None);
+    }
+    #[test]
+    fn hotkey_replacing_tray_commit_completes_superseded_request() {
+        use crate::hotkey::AdjustParam;
+        let (tx, rx) = channel();
+        let q = Inbox { events: Some(tx), ..Inbox::default() };
+        q.push(Envelope {
+            command: AppCommand::TrayValueCommit {
+                param: AdjustParam::Contrast, value: 30, generation: 7, request_id: 41,
+            }, token: None, dispatch_generation: 7, revision: 0,
+        }).unwrap();
+        q.push(Envelope {
+            command: AppCommand::HotkeyCommit {
+                param: AdjustParam::Contrast, value: 40, generation: 7,
+            }, token: None, dispatch_generation: 7, revision: 0,
+        }).unwrap();
+        assert_eq!(q.queue.lock().len(), 1);
+        assert!(matches!(q.receive().unwrap().command, AppCommand::HotkeyCommit { value: 40, .. }));
+        assert!(matches!(rx.try_recv().unwrap(), AppEvent::TrayValueResult {
+            request_id: 41, generation: 7, error: Some(_),
+        }));
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
     fn slider_queue_keeps_last_and_orders_after_reads() {
         let q = Inbox::default();
         q.push(Envelope {
@@ -1175,5 +1508,62 @@ mod tests {
                 revision: 1
             })
             .is_err());
+    }
+    #[test]
+    fn hotkey_commit_coalesces_same_param_and_preserves_different_params() {
+        use crate::hotkey::AdjustParam;
+        let q = Inbox::default();
+        q.push(Envelope {
+            command: AppCommand::HotkeyCommit {
+                param: AdjustParam::Backlight,
+                value: 30,
+                generation: 1,
+            },
+            token: None,
+            dispatch_generation: 1,
+            revision: 1,
+        })
+        .unwrap();
+        q.push(Envelope {
+            command: AppCommand::HotkeyCommit {
+                param: AdjustParam::Backlight,
+                value: 40,
+                generation: 1,
+            },
+            token: None,
+            dispatch_generation: 1,
+            revision: 2,
+        })
+        .unwrap();
+        q.push(Envelope {
+            command: AppCommand::HotkeyCommit {
+                param: AdjustParam::Contrast,
+                value: 50,
+                generation: 1,
+            },
+            token: None,
+            dispatch_generation: 1,
+            revision: 3,
+        })
+        .unwrap();
+        assert_eq!(q.queue.lock().len(), 2);
+        let first = q.receive().unwrap().command;
+        assert!(matches!(
+            first,
+            AppCommand::HotkeyCommit {
+                param: AdjustParam::Backlight,
+                value: 40,
+                ..
+            }
+        ));
+        let second = q.receive().unwrap().command;
+        assert!(matches!(
+            second,
+            AppCommand::HotkeyCommit {
+                param: AdjustParam::Contrast,
+                value: 50,
+                ..
+            }
+        ));
     }
 }

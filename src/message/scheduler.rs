@@ -99,6 +99,12 @@ impl SchedulerEngine {
             identity: None,
         }
     }
+    /// 检查调度器当前是否处于任务执行中或存在待还原基线
+    pub fn is_active_or_pending_restore(&self) -> bool {
+        self.state.active_task_id.is_some()
+            || self.state.pending_restore.is_some()
+            || self.state.pending_restore_record.is_some()
+    }
     pub fn edit(
         &mut self,
         command: &AppCommand,

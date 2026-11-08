@@ -95,6 +95,9 @@ impl AdvancedPicture {
         self.busy = false;
         self.sync(cx);
     }
+    pub fn state(&self) -> &PictureParametersState {
+        &self.state
+    }
     fn sync(&mut self, cx: &mut Context<Self>) {
         for (i, gain) in self.gains.iter().enumerate() {
             let v = [

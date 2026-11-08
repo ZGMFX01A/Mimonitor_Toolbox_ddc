@@ -27,7 +27,7 @@ impl AutoTaskPage {
                 .presets
                 .first()
                 .map(|p| p.id.clone())
-                .unwrap_or_default(),
+                .unwrap_or_else(|| crate::presets::BASELINE_PRESET_ID.into()),
             config,
             editing: None,
             deleting: None,
@@ -36,6 +36,10 @@ impl AutoTaskPage {
         }
     }
     pub fn sync(&mut self, config: AppConfig, cx: &mut Context<Self>) {
+        if self.preset != crate::presets::BASELINE_PRESET_ID
+            && !config.presets.iter().any(|preset| preset.id == self.preset) {
+            self.preset = crate::presets::BASELINE_PRESET_ID.into();
+        }
         self.config = config;
         cx.notify();
     }

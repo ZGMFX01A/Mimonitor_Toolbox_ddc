@@ -3,42 +3,30 @@ use gpui::{
     div, rgb, Context, Div, Entity, InteractiveElement, IntoElement, ParentElement, Render, Styled,
     WeakEntity, Window,
 };
+#[cfg(test)]
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::config::PresetItem;
 use crate::message::{AppCommand, AppEvent, MessageBus};
+use crate::message::preset_sync::PresetConfigMutation;
 use crate::presets::{find_preset, missing_keys, new_id, unique_name};
 use crate::ui::components::{action_button, badge, card_container, TextInput};
 use crate::ui::theme::ThemeColors;
 
 /// 异步保存预设相关的配置字段，严格在后台线程执行 IO，防覆盖其他页配置
 pub fn async_save_preset_config(
-    presets: Vec<PresetItem>,
-    preset_snapshot: Option<HashMap<String, serde_json::Value>>,
-    active_preset_id: Option<String>,
+    mutation: PresetConfigMutation,
     bus: Arc<MessageBus>,
-) {
-    std::thread::spawn(move || {
-        match crate::config::update_settings(|config| {
-            config.presets = presets;
-            config.preset_snapshot = preset_snapshot;
-            config.active_preset_id = active_preset_id;
-        }) {
-            Ok(config) => {
-                let _ = bus
-                    .event_sender
-                    .send(AppEvent::ConfigUpdated((*config).clone()));
-            }
-            Err(error) => {
-                let _ = bus.event_sender.send(AppEvent::ToastNotification {
-                    message: format!("保存预设配置失败：{error}"),
-                    is_error: true,
-                });
-            }
-        }
-    });
+) -> u64 {
+    let request_id = crate::ddc::next_ddc_revision();
+    if bus.cmd_sender.send(AppCommand::EditPresetConfig { mutation: mutation.clone(), request_id }).is_err() {
+        let _ = bus.event_sender.send(AppEvent::PresetConfigResult {
+            request_id, mutation, error: Some("保存预设失败：后台已停止".into()),
+        });
+    }
+    request_id
 }
 
 /// 预设模式管理页面视图组件
@@ -49,8 +37,11 @@ pub struct PresetPageView {
     name_input: Entity<TextInput>,
     /// 后台正在进行的长耗时操作提示（如抓取中、应用中、恢复中）
     pending_operation: Option<String>,
+    pending_config_request: Option<u64>,
     /// 当前操作的代数 (generation)，用于拒绝过期回调
     pending_generation: u64,
+    /// 待跳转画面编辑的目标预设 ID（若有）
+    pending_edit_target: Option<String>,
     /// 处于应用内两阶段删除确认中的预设 ID
     confirm_delete_id: Option<String>,
     confirm_restore: bool,
@@ -76,7 +67,9 @@ impl PresetPageView {
             bus,
             name_input,
             pending_operation: None,
+            pending_config_request: None,
             pending_generation: 0,
+            pending_edit_target: None,
             confirm_delete_id: None,
             confirm_restore: false,
             editing_preset_id: None,
@@ -87,7 +80,58 @@ impl PresetPageView {
 
     /// 处理后台总线投递的预设相关业务事件
     pub fn handle_event(&mut self, evt: &AppEvent, cx: &mut Context<Self>) {
+        let event_generation = match evt {
+            AppEvent::PresetSnapshotCaptured { generation, .. }
+            | AppEvent::PresetApplied { generation, .. }
+            | AppEvent::BaselineRestored { generation, .. }
+            | AppEvent::PresetOperationFailed { generation, .. }
+            | AppEvent::AdbStateChanged { generation, .. } => Some(*generation),
+            _ => None,
+        };
+        if event_generation.is_some_and(|generation| {
+            generation != self.bus.active_generation.load(Ordering::Acquire)
+        }) {
+            return;
+        }
         match evt {
+            AppEvent::PresetConfigResult { request_id, mutation, error } => {
+                if self.pending_config_request != Some(*request_id) { return; }
+                self.pending_config_request = None;
+                self.pending_operation = None;
+                if let Some(error) = error {
+                    self.page_toast = Some((error.clone(), true));
+                } else {
+                    self.page_toast = Some((match mutation {
+                        PresetConfigMutation::AddAndActivate { .. } => "预设已创建并保存",
+                        PresetConfigMutation::UpdateValues { .. } => "预设参数已更新并保存",
+                        PresetConfigMutation::Rename { .. } => "预设名称已保存",
+                        PresetConfigMutation::Delete { .. } => "预设已删除",
+                    }.into(), false));
+                    if matches!(mutation, PresetConfigMutation::AddAndActivate { .. })
+                        && mutation.generation() == Some(self.bus.active_generation.load(Ordering::Acquire)) {
+                        self.name_input.update(cx, |input, cx| input.set_text("", cx));
+                        if let Some(state) = self.app_state.upgrade() {
+                            state.update(cx, |st, cx| {
+                                st.active_tab = "画面设置".into();
+                                cx.notify();
+                            });
+                        }
+                        let generation = self.bus.active_generation.load(Ordering::Acquire);
+                        let _ = self.bus.cmd_sender.send(AppCommand::FetchPictureParameters { generation });
+                    }
+                }
+                cx.notify();
+            }
+            AppEvent::AdbStateChanged { state, generation, .. } => {
+                if !state.is_connected() || *generation != self.pending_generation {
+                    if self.pending_config_request.is_none() {
+                        self.pending_operation = None;
+                    }
+                    self.pending_edit_target = None;
+                    self.confirm_restore = false;
+                    cx.notify();
+                }
+            }
             AppEvent::PresetSnapshotCaptured {
                 name,
                 update_preset_id,
@@ -104,72 +148,40 @@ impl PresetPageView {
                     None => return,
                 };
 
-                let bus = self.bus.clone();
-                let values_clone = values.clone();
-
                 if let Some(target_id) = update_preset_id {
-                    let mut found_name = String::new();
-                    app_state_entity.update(cx, |st, cx| {
-                        if let Some(pos) = st.config.presets.iter().position(|p| p.id == *target_id)
-                        {
-                            found_name = st.config.presets[pos].name.clone();
-                            st.config.presets[pos].values = values_clone.clone();
-                        }
-                        async_save_preset_config(
-                            st.config.presets.clone(),
-                            st.config.preset_snapshot.clone(),
-                            st.config.active_preset_id.clone(),
-                            bus,
-                        );
-                        cx.notify();
-                    });
-                    self.page_toast = Some((
-                        format!("已成功从设备抓取最新参数覆盖预设「{}」", found_name),
-                        false,
+                    self.pending_config_request = Some(async_save_preset_config(
+                        PresetConfigMutation::UpdateValues {
+                            id: target_id.clone(), values: values.clone(), generation: *generation,
+                        }, self.bus.clone(),
                     ));
+                    self.pending_operation = Some("参数已抓取，正在保存预设…".into());
+                    self.page_toast = None;
                 } else if let Some(wanted_name) = name {
-                    let mut created_name = String::new();
-                    let name_input_entity = self.name_input.clone();
-
-                    app_state_entity.update(cx, |st, cx| {
-                        let final_name = unique_name(&st.config.presets, wanted_name);
-                        created_name = final_name.clone();
-                        let new_preset_id = new_id(&st.config.presets, "preset");
-                        st.config.presets.push(PresetItem {
-                            id: new_preset_id.clone(),
-                            name: final_name,
-                            values: values_clone,
-                        });
-                        st.config.active_preset_id = Some(new_preset_id);
-
-                        async_save_preset_config(
-                            st.config.presets.clone(),
-                            st.config.preset_snapshot.clone(),
-                            st.config.active_preset_id.clone(),
-                            bus,
-                        );
-                        cx.notify();
-                    });
-
-                    name_input_entity.update(cx, |input, cx| {
-                        input.set_text("", cx);
-                    });
-
-                    self.page_toast = Some((
-                        format!("已成功采集当前设备快照并创建预设「{}」", created_name),
-                        false,
+                    let st = app_state_entity.read(cx);
+                    let preset = PresetItem {
+                        id: new_id(&st.config.presets, "preset"),
+                        name: unique_name(&st.config.presets, wanted_name), values: values.clone(),
+                    };
+                    self.pending_config_request = Some(async_save_preset_config(
+                        PresetConfigMutation::AddAndActivate { preset, generation: *generation }, self.bus.clone(),
                     ));
+                    self.pending_operation = Some("参数已抓取，正在创建预设…".into());
+                    self.page_toast = None;
                 }
                 cx.notify();
             }
 
             AppEvent::PresetApplied {
-                result, generation, ..
+                preset_id,
+                result,
+                generation,
+                ..
             } => {
                 if *generation != self.pending_generation {
                     return;
                 }
                 self.pending_operation = None;
+                let pending_target = self.pending_edit_target.take();
                 let is_fully_ok = result.failed.is_empty() && !result.applied.is_empty();
                 self.page_toast = Some((
                     format!(
@@ -183,6 +195,22 @@ impl PresetPageView {
                     ),
                     !is_fully_ok,
                 ));
+
+                // 处于“编辑画面”流程且目标匹配且完全成功时，跳转画面设置并刷新
+                if is_fully_ok && pending_target.as_deref() == Some(preset_id.as_str()) {
+                    if let Some(app_state_entity) = self.app_state.upgrade() {
+                        app_state_entity.update(cx, |st, cx| {
+                            st.active_tab = "画面设置".to_string();
+                            cx.notify();
+                        });
+                        let gen = self.bus.active_generation.load(Ordering::Acquire);
+                        let _ = self
+                            .bus
+                            .cmd_sender
+                            .send(AppCommand::FetchPictureParameters { generation: gen });
+                    }
+                }
+
                 cx.notify();
             }
             AppEvent::BaselineRestored { result, generation } => {
@@ -208,6 +236,7 @@ impl PresetPageView {
             } => {
                 if *generation == self.pending_generation {
                     self.pending_operation = None;
+                    self.pending_edit_target = None;
                     self.page_toast = Some((message.clone(), true));
                     cx.notify();
                 }
@@ -219,6 +248,7 @@ impl PresetPageView {
 
     /// 点击“从当前设备抓取并新增”
     fn on_capture_new(&mut self, cx: &mut Context<Self>) {
+        self.pending_edit_target = None;
         if self.pending_operation.is_some() {
             return;
         }
@@ -257,6 +287,7 @@ impl PresetPageView {
 
     /// 点击“恢复基线”
     fn on_restore_baseline(&mut self, cx: &mut Context<Self>) {
+        self.pending_edit_target = None;
         if self.pending_operation.is_some() {
             return;
         }
@@ -304,6 +335,7 @@ impl PresetPageView {
 
     /// 点击“应用预设”
     fn on_apply_preset(&mut self, preset_id: String, cx: &mut Context<Self>) {
+        self.pending_edit_target = None;
         if self.pending_operation.is_some() {
             return;
         }
@@ -354,8 +386,59 @@ impl PresetPageView {
         });
     }
 
+    /// 点击“编辑画面”
+    fn on_edit_preset(&mut self, preset_id: String, cx: &mut Context<Self>) {
+        if self.pending_operation.is_some() {
+            return;
+        }
+
+        let app_state_entity = match self.app_state.upgrade() {
+            Some(e) => e,
+            None => return,
+        };
+
+        let (is_connected, is_current_active) = {
+            let state = app_state_entity.read(cx);
+            (
+                state.adb_state.is_connected(),
+                state.config.active_preset_id.as_deref() == Some(&preset_id),
+            )
+        };
+
+        if !is_connected {
+            self.pending_edit_target = None;
+            self.page_toast = Some(("显示器未连接无线 ADB，无法进入预设画面编辑".into(), true));
+            cx.notify();
+            return;
+        }
+
+        if is_current_active {
+            // 已是当前预设且连接，直接跳转画面设置页并刷新
+            self.pending_edit_target = None;
+            app_state_entity.update(cx, |st, cx| {
+                st.active_tab = "画面设置".to_string();
+                cx.notify();
+            });
+            let gen = self.bus.active_generation.load(Ordering::Acquire);
+            let _ = self
+                .bus
+                .cmd_sender
+                .send(AppCommand::FetchPictureParameters { generation: gen });
+            return;
+        }
+
+        // 非当前预设：沿用 on_apply_preset 下发，并记录 pending_edit_target 等待真正成功
+        self.on_apply_preset(preset_id.clone(), cx);
+        if self.pending_operation.is_some() {
+            self.pending_edit_target = Some(preset_id);
+        } else {
+            self.pending_edit_target = None;
+        }
+    }
+
     /// 点击“重新抓取更新”
     fn on_recapture_preset(&mut self, preset_id: String, cx: &mut Context<Self>) {
+        self.pending_edit_target = None;
         if self.pending_operation.is_some() {
             return;
         }
@@ -416,6 +499,7 @@ impl PresetPageView {
 
     /// 提交重命名
     fn on_confirm_rename(&mut self, preset_id: String, cx: &mut Context<Self>) {
+        if self.pending_operation.is_some() { return; }
         let new_name = match &self.rename_input {
             Some(input) => input.read(cx).text().trim().to_string(),
             None => return,
@@ -427,40 +511,15 @@ impl PresetPageView {
             return;
         }
 
-        let app_state_entity = match self.app_state.upgrade() {
-            Some(e) => e,
-            None => return,
-        };
-
-        let bus = self.bus.clone();
-        let mut final_name = String::new();
-
-        app_state_entity.update(cx, |st, cx| {
-            let others: Vec<PresetItem> = st
-                .config
-                .presets
-                .iter()
-                .filter(|p| p.id != preset_id)
-                .cloned()
-                .collect();
-            final_name = unique_name(&others, &new_name);
-
-            if let Some(pos) = st.config.presets.iter().position(|p| p.id == preset_id) {
-                st.config.presets[pos].name = final_name.clone();
-            }
-
-            async_save_preset_config(
-                st.config.presets.clone(),
-                st.config.preset_snapshot.clone(),
-                st.config.active_preset_id.clone(),
-                bus,
-            );
-            cx.notify();
-        });
+        if self.app_state.upgrade().is_none() { return; }
+        self.pending_config_request = Some(async_save_preset_config(
+            PresetConfigMutation::Rename { id: preset_id, name: new_name }, self.bus.clone(),
+        ));
+        self.pending_operation = Some("正在保存预设名称…".into());
 
         self.editing_preset_id = None;
         self.rename_input = None;
-        self.page_toast = Some((format!("已将预设重命名为「{}」", final_name), false));
+        self.page_toast = None;
         cx.notify();
     }
 
@@ -473,34 +532,14 @@ impl PresetPageView {
 
     /// 确认删除预设
     fn on_confirm_delete(&mut self, preset_id: String, cx: &mut Context<Self>) {
-        let app_state_entity = match self.app_state.upgrade() {
-            Some(e) => e,
-            None => return,
-        };
-
-        let bus = self.bus.clone();
-        let mut deleted_name = String::new();
-
-        app_state_entity.update(cx, |st, cx| {
-            if let Some(pos) = st.config.presets.iter().position(|p| p.id == preset_id) {
-                deleted_name = st.config.presets[pos].name.clone();
-                st.config.presets.remove(pos);
-            }
-            if st.config.active_preset_id.as_deref() == Some(&preset_id) {
-                st.config.active_preset_id = None;
-            }
-
-            async_save_preset_config(
-                st.config.presets.clone(),
-                st.config.preset_snapshot.clone(),
-                st.config.active_preset_id.clone(),
-                bus,
-            );
-            cx.notify();
-        });
+        if self.pending_operation.is_some() { return; }
+        self.pending_config_request = Some(async_save_preset_config(
+            PresetConfigMutation::Delete { id: preset_id }, self.bus.clone(),
+        ));
+        self.pending_operation = Some("正在删除预设…".into());
 
         self.confirm_delete_id = None;
-        self.page_toast = Some((format!("已删除预设「{}」", deleted_name), false));
+        self.page_toast = None;
         cx.notify();
     }
 }
@@ -748,6 +787,7 @@ impl Render for PresetPageView {
                             let is_editing = self.editing_preset_id.as_deref() == Some(&pid);
                             let is_confirm_delete = self.confirm_delete_id.as_deref() == Some(&pid);
 
+                            let pid_for_edit = pid.clone();
                             let pid_for_apply = pid.clone();
                             let pid_for_recapture = pid.clone();
                             let pid_for_rename_start = pid.clone();
@@ -911,6 +951,18 @@ impl Render for PresetPageView {
                                             .pt_2()
                                             .child(
                                                 div()
+                                                    .id(("btn_edit_picture", idx))
+                                                    .child(action_button(
+                                                        "编辑画面",
+                                                        false,
+                                                        is_busy || !adb_connected,
+                                                    ))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.on_edit_preset(pid_for_edit.clone(), cx);
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
                                                     .id(("btn_apply_preset", idx))
                                                     .child(action_button(
                                                         if is_active { "重新应用" } else { "应用预设" },
@@ -1046,4 +1098,5 @@ mod tests {
         assert_eq!(updated.active_preset_id, Some("preset_1".into()));
         assert!(updated.preset_snapshot.is_some());
     }
+
 }

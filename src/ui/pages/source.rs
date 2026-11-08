@@ -17,7 +17,6 @@ pub struct SourcePage {
     is_reading: bool,
     is_switching: bool,
     target_source: Option<VideoSource>,
-    pending_confirm: Option<VideoSource>,
     error_message: Option<String>,
     status_message: Option<String>,
     generation: u64,
@@ -34,7 +33,6 @@ impl SourcePage {
             is_reading: false,
             is_switching: false,
             target_source: None,
-            pending_confirm: None,
             error_message: None,
             status_message: None,
             generation: gen,
@@ -51,7 +49,6 @@ impl SourcePage {
             self.is_reading = false;
             self.is_switching = false;
             self.target_source = None;
-            self.pending_confirm = None;
             self.status_message = None;
             self.error_message = None;
         }
@@ -87,7 +84,7 @@ impl SourcePage {
         self.is_switching = false;
         self.target_source = None;
         self.current_source = Some(source);
-        self.status_message = Some(format!("已成功切换并延时验证信号源为 {}", source.name()));
+        self.status_message = Some(format!("已切换到 {}", source.name()));
         self.error_message = None;
         cx.notify();
     }
@@ -126,10 +123,13 @@ impl SourcePage {
         self.error_message = None;
         let gen = self.bus.active_generation.load(Ordering::Relaxed);
         self.generation = gen;
-        let _ = self
+        if self
             .bus
             .cmd_sender
-            .send(AppCommand::RefreshSource { generation: gen });
+            .send(AppCommand::RefreshSource { generation: gen }).is_err() {
+            self.is_reading = false;
+            self.error_message = Some("读取提交失败：后台忙或已停止，请稍后重试".into());
+        }
         cx.notify();
     }
 
@@ -137,36 +137,28 @@ impl SourcePage {
         if !self.is_connected || self.is_switching {
             return;
         }
-        self.pending_confirm = Some(target);
-        self.error_message = None;
-        cx.notify();
-    }
-
-    pub fn confirm_switch(&mut self, target: VideoSource, cx: &mut Context<Self>) {
-        if !self.is_connected || self.is_switching {
-            return;
-        }
-        self.pending_confirm = None;
         self.is_switching = true;
         self.target_source = Some(target);
         self.status_message = Some(format!(
-            "正在切换至 {} 并等待延时回读确认...",
+            "正在切换到 {}，请稍候…",
             target.name()
         ));
         self.error_message = None;
         let gen = self.bus.active_generation.load(Ordering::Relaxed);
         self.generation = gen;
-        let _ = self.bus.cmd_sender.send(AppCommand::SwitchSource {
+        if self.bus.cmd_sender.send(AppCommand::SwitchSource {
             source: target,
             generation: gen,
-        });
+        }).is_err() {
+            self.is_switching = false;
+            self.target_source = None;
+            self.status_message = None;
+            self.error_message = Some("切换提交失败：后台忙或已停止，请稍后重试".into());
+        }
         cx.notify();
     }
 
-    pub fn cancel_confirm(&mut self, cx: &mut Context<Self>) {
-        self.pending_confirm = None;
-        cx.notify();
-    }
+
 }
 
 impl Render for SourcePage {
@@ -175,7 +167,6 @@ impl Render for SourcePage {
         let is_switching = self.is_switching;
         let is_reading = self.is_reading;
         let current_source = self.current_source;
-        let pending_confirm = self.pending_confirm;
 
         div()
             .flex()
@@ -205,7 +196,7 @@ impl Render for SourcePage {
                                 div()
                                     .text_xs()
                                     .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
-                                    .child("HDMI 1 / HDMI 2 / DP / Type-C 端口切换与异步回读验证"),
+                                    .child("点击 HDMI / DP / Type-C 即可切换，画面会短暂中断。"),
                             ),
                     )
                     .child(
@@ -261,7 +252,7 @@ impl Render for SourcePage {
                                 .text_3xl()
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(rgb(ThemeColors::ACCENT_CYAN()))
-                                .child(format!("{} (ID: {})", src.name(), src.id()))
+                                .child(src.name())
                         } else if !self.raw_source.is_empty() {
                             div()
                                 .text_2xl()
@@ -277,61 +268,6 @@ impl Render for SourcePage {
                         },
                     ),
             )
-            // 应用内切源确认卡片 (防误触防黑屏)
-            .when_some(pending_confirm, |d, target| {
-                d.child(
-                    card_container()
-                        .border_color(rgb(ThemeColors::STATUS_WARNING()))
-                        .bg(rgb(ThemeColors::STATUS_WARNING_BG()))
-                        .gap_3()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .font_weight(gpui::FontWeight::BOLD)
-                                        .text_color(rgb(ThemeColors::STATUS_WARNING()))
-                                        .child("⚠️ 屏幕短暂黑屏预警与操作确认"),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
-                                .child(format!(
-                                    "即将切换显示器信号源至「{}」(端口 ID: {})。切换过程中屏幕将短暂断开信号并黑屏数秒，待新源建立握手后自动亮起。是否确认立即切换？",
-                                    target.name(),
-                                    target.id()
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .gap_3()
-                                .child(
-                                    div()
-                                        .id("btn_confirm_switch_action")
-                                        .child(action_button("确认切换", true, false))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.confirm_switch(target, cx);
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id("btn_cancel_switch_action")
-                                        .child(action_button("取消", false, false))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cancel_confirm(cx);
-                                        })),
-                                ),
-                        ),
-                )
-            })
             // 端口选择列表卡片 (包含完整 23 HDMI 1, 24 HDMI 2, 29 DP, 30 Type-C)
             .child(
                 card_container()
@@ -412,12 +348,6 @@ impl Render for SourcePage {
                                                     .when(is_active, |d| {
                                                         d.child(badge("当前活跃", ThemeColors::STATUS_SUCCESS_BG(), ThemeColors::STATUS_SUCCESS()))
                                                     }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
-                                                    .child(format!("端口 ID: {}", source.id())),
                                             ),
                                     )
                             })),

@@ -24,6 +24,7 @@ pub enum TrayEvent {
     RefreshMonitors,
     Quit,
     Custom(catalog::Choice),
+    OpenValueSlider(crate::hotkey::AdjustParam),
 }
 
 const WM_TRAY_CALLBACK: u32 = WM_USER + 101;
@@ -106,6 +107,20 @@ impl SystemTrayManager {
                                         catalog.iter().find(|entry| entry.id == key)
                                     {
                                         if let Ok(submenu) = CreatePopupMenu() {
+                                            if let Some(idx) = crate::hotkey::AdjustParam::ALL
+                                                .iter()
+                                                .position(|p| p.as_str() == entry.id)
+                                            {
+                                                let id = 3000 + idx;
+                                                let label: Vec<u16> =
+                                                    "滑杆调节…".encode_utf16().chain(Some(0)).collect();
+                                                let _ = AppendMenuW(
+                                                    submenu,
+                                                    MF_STRING,
+                                                    id,
+                                                    PCWSTR(label.as_ptr()),
+                                                );
+                                            }
                                             for (label, choice) in &entry.choices {
                                                 let mut choices = MENU_CHOICES.lock();
                                                 let id = 2000 + choices.len();
@@ -156,6 +171,12 @@ impl SystemTrayManager {
                                         }
                                         CMD_QUIT => {
                                             let _ = tx.send(TrayEvent::Quit);
+                                        }
+                                        id @ 3000..3010 => {
+                                            let idx = id - 3000;
+                                            if let Some(&param) = crate::hotkey::AdjustParam::ALL.get(idx) {
+                                                let _ = tx.send(TrayEvent::OpenValueSlider(param));
+                                            }
                                         }
                                         id if id >= 2000 => {
                                             if let Some(choice) =

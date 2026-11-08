@@ -47,42 +47,42 @@ impl ThemeColors {
 
     /// 禁用状态背景色
     pub fn BG_DISABLED() -> u32 {
-        Self::pick(0x1a1d23, 0xf1f5f9)
+        Self::pick(0x181b21, 0xf8fafc)
     }
 
     /// 进度条等滑轨背景色
     pub fn BG_TRACK() -> u32 {
-        Self::pick(0x272c36, 0xe2e8f0)
+        Self::pick(0x252a34, 0xe2e8f0)
     }
 
     /// 主边框线条颜色
     pub fn BORDER() -> u32 {
-        Self::pick(0x323944, 0xdae2ec)
+        Self::pick(0x2d3440, 0xe2e8f0)
     }
 
     /// 禁用状态边框色
     pub fn BORDER_DISABLED() -> u32 {
-        Self::pick(0x262b33, 0xe2e8f0)
+        Self::pick(0x222730, 0xedf2f7)
     }
 
     /// 现代克制蓝/青强调色（主操作/激活态）
     pub fn ACCENT_CYAN() -> u32 {
-        Self::pick(0x0ea5e9, 0x0279b5)
+        Self::pick(0x0284c7, 0x0284c7)
     }
 
     /// 强调色悬停态
     pub fn ACCENT_HOVER() -> u32 {
-        Self::pick(0x38bdf8, 0x0369a1)
+        Self::pick(0x0369a1, 0x0369a1)
     }
 
     /// 强调色极淡背景（用于徽章、轻量高亮等）
     pub fn ACCENT_BG_SUBTLE() -> u32 {
-        Self::pick(0x132a38, 0xe0f2fe)
+        Self::pick(0x132637, 0xf0f7ff)
     }
 
     /// 一级主文本
     pub fn TEXT_PRIMARY() -> u32 {
-        Self::pick(0xf1f5f9, 0x0f172a)
+        Self::pick(0xf8fafc, 0x0f172a)
     }
 
     /// 二级次要文本
@@ -92,17 +92,17 @@ impl ThemeColors {
 
     /// 静音/辅助文本
     pub fn TEXT_MUTED() -> u32 {
-        Self::pick(0x64748b, 0x64748b)
+        Self::pick(0x718096, 0x64748b)
     }
 
     /// 禁用文本颜色
     pub fn TEXT_DISABLED() -> u32 {
-        Self::pick(0x475569, 0x94a3b8)
+        Self::pick(0x59677b, 0x8b9cb0)
     }
 
     /// 强调色背景上的前景色
     pub fn TEXT_ON_ACCENT() -> u32 {
-        Self::pick(0x082f49, 0xffffff)
+        Self::pick(0xffffff, 0xffffff)
     }
 
     /// 成功状态色

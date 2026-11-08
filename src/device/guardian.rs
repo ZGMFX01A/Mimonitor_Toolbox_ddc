@@ -1,5 +1,5 @@
 use crate::adb::{AdbDevice, AdbError};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// AdbGuardian 包名
@@ -179,24 +179,7 @@ pub fn compute_updated_accessibility_services(current_services: &str) -> String 
 
 /// 获取本地分发的 adbguardian-signed.apk 路径
 pub fn get_local_guardian_apk_path() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let p = parent
-                .join("assets")
-                .join("adb_guardian")
-                .join(GUARDIAN_APK_NAME);
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
-    let p = Path::new("assets")
-        .join("adb_guardian")
-        .join(GUARDIAN_APK_NAME);
-    if p.exists() {
-        return Some(p);
-    }
-    None
+    crate::resources::helper_path(GUARDIAN_APK_NAME)
 }
 
 /// 检测设备上 AdbGuardian 的完整运行与保活状态
@@ -236,7 +219,7 @@ pub fn check_guardian_status(adb: &AdbDevice) -> Result<GuardianStatus, AdbError
 /// 部署流程各个明确阶段
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeployStage {
-    /// 步骤1: 定位本地 assets/adb_guardian/adbguardian-signed.apk
+    /// 步骤1: 部署内置 AdbGuardian APK
     LocateApk,
     /// 步骤2: 本地执行 adb install -r -d 并验证输出包含 Success
     InstallApk,
@@ -324,7 +307,7 @@ pub fn deploy_guardian(adb: &AdbDevice) -> Result<GuardianDeployReceipt, Guardia
         None => {
             return Err(GuardianDeployError {
                 stage: DeployStage::LocateApk,
-                message: "未在 assets/adb_guardian 找到 adbguardian-signed.apk".to_string(),
+                message: "内置 AdbGuardian 资源部署失败".to_string(),
                 install_completed: false,
             });
         }

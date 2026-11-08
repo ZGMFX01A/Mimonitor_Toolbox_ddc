@@ -1,6 +1,6 @@
 ﻿# 第三方开源许可证与版权声明 (Third-Party Notices)
 
-> 本文件随 **Mimonitor Toolbox** (Rust + GPUI Windows 客户端) 及其便携分发包一同提供。  
+> 本文件随 **Mimonitor Toolbox** (Rust + GPUI Windows 客户端) 以单个 EXE 分发。许可原文内嵌于程序，可在“工具与设置 → 第三方许可”中查看。
 > 本项目完全基于原生 Rust 与 Win32 API 构建，运行时**不包含** Python、Qt、Node.js、Electron 或 Java 虚拟机运行时。  
 > 除随包分发的标准开源 Android SDK Platform-Tools ADB 客户端之外，所有业务逻辑均由原生二进制执行。
 
@@ -42,12 +42,12 @@
 - **许可证全文文件**: `licenses/components/LICENSE-android-platform-tools.txt`
 - **使用范围与说明**: 内嵌未修改的原生 Windows x64 ADB 客户端，用于通过独立隔离端口（TCP 15038）与小米/红米显示器建立通信。
 
-### 1.5 Microsoft Visual C++ Runtime (VCRUNTIME140.dll)
+### 1.5 Microsoft Visual C++ Runtime
 - **许可属性**: 微软专有软件可再分发代码 (Microsoft Visual Studio Redistributable Code)
 - **版权所有**: Copyright (C) Microsoft Corporation. All rights reserved.
-- **包含文件**: `vcruntime140.dll`（App-Local 存放于便携包根目录与 `assets/runtime/` 目录）
+- **分发形式**: 主程序静态链接 C/C++ 运行库，不另外分发 `vcruntime140.dll`。
 - **许可说明文件**: `licenses/components/NOTICE-msvc-redist.txt` 与 `licenses/components/Redist.txt`
-- **分发说明**: 依据 Microsoft Visual Studio 软件许可条款，本项目采用 App-Local 方式随包分发匹配 x64 架构的官方可再分发动态库 `vcruntime140.dll`，使程序在未预装 Visual C++ Redistributable 的干净 Windows 10/11 操作系统上能够自足开箱即用。本组件属于微软专有可再分发组件，受微软许可条款约束，**绝非** MIT/Apache 等开源软件。
+- **分发说明**: 依据 Microsoft Visual Studio 软件许可条款，程序使用静态链接的运行库代码，用户无需另外安装 Visual C++ Redistributable。本组件属于微软专有可再分发组件，受微软许可条款约束，**绝非** MIT/Apache 等开源软件。
 
 ---
 
