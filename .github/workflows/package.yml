@@ -1,5 +1,5 @@
-name: Package Windows EXE
-run-name: Package ${{ github.ref_name }}
+name: Release Windows EXE
+run-name: Release ${{ github.ref_name }}
 
 # Only tag pushes create a run. Branch pushes, PRs and manual dispatches do not.
 on:
@@ -17,6 +17,8 @@ concurrency:
 jobs:
   package:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.event.deleted == false
+    permissions:
+      contents: write
     runs-on: windows-2022
     timeout-minutes: 45
     defaults:
@@ -58,11 +60,24 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           "### MimonitorToolbox.exe`nSHA256: ``$hash``" >> $env:GITHUB_STEP_SUMMARY
 
-      - name: Upload the standalone EXE
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: Mimonitor-Toolbox-${{ steps.package.outputs.version }}-windows-x64
-          path: ${{ steps.package.outputs.exe }}
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 30
+      - name: Publish the standalone EXE to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_EXE: ${{ steps.package.outputs.exe }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $exe = $env:RELEASE_EXE
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Missing executable: $exe" }
+          $notes = Join-Path '.github/release-notes' "$tag.md"
+          $releaseArgs = @('release', 'create', $tag, $exe, '--repo', $env:GH_REPO, '--verify-tag', '--title', $tag)
+          if (Test-Path -LiteralPath $notes -PathType Leaf) {
+            $releaseArgs += @('--notes-file', $notes)
+          } else {
+            $releaseArgs += '--generate-notes'
+          }
+          # gh uploads this runner's EXE before publishing the release.
+          # An existing release is never overwritten or clobbered.
+          & gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
