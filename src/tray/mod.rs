@@ -3,17 +3,20 @@ use parking_lot::Mutex;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use windows::core::{w, PCWSTR};
+use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostMessageW, PostQuitMessage,
+    DispatchMessageW, EnumThreadWindows, GetClassNameW, GetCursorPos, GetMessageW, IsWindowVisible,
+    KillTimer, LoadIconW, PostMessageW, PostQuitMessage, SetTimer,
     RegisterClassW, SetForegroundWindow, TrackPopupMenuEx, TranslateMessage, CW_USEDEFAULT,
-    MF_SEPARATOR, MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
-    WM_LBUTTONUP, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPED,
+    MF_SEPARATOR, MF_STRING, TPM_NOANIMATION, TPM_RETURNCMD, WM_CLOSE, WM_DESTROY,
+    WM_INITMENUPOPUP, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER, WM_USER, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 
 /// 托盘后台线程向 GPUI 线程桥接分发的强类型事件
@@ -35,6 +38,29 @@ const CMD_QUIT: usize = 1004;
 
 static MENU_CHOICES: Mutex<Vec<catalog::Choice>> = Mutex::new(Vec::new());
 static EVENT_SENDER: Mutex<Option<Sender<TrayEvent>>> = Mutex::new(None);
+
+thread_local! {
+    static MENU_PAINT_TIMER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MENU_PAINT_SERIAL: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+unsafe fn cancel_menu_paint(hwnd: HWND) {
+    let timer = MENU_PAINT_TIMER.replace(0);
+    if timer != 0 {
+        let _ = KillTimer(Some(hwnd), timer);
+    }
+}
+
+unsafe extern "system" fn paint_visible_menu(hwnd: HWND, _: LPARAM) -> BOOL {
+    let mut class_name = [0u16; 32];
+    let length = GetClassNameW(hwnd, &mut class_name) as usize;
+    if IsWindowVisible(hwnd).as_bool() && &class_name[..length] == w!("#32768").as_wide() {
+        let _ = RedrawWindow(
+            Some(hwnd), None, None, RDW_INVALIDATE | RDW_UPDATENOW | RDW_FRAME,
+        );
+    }
+    BOOL(1)
+}
 
 /// 系统托盘管理器
 pub struct SystemTrayManager {
@@ -150,12 +176,18 @@ impl SystemTrayManager {
 
                                 let cmd = TrackPopupMenuEx(
                                     h_menu,
-                                    (TPM_RETURNCMD | TPM_NONOTIFY).0,
+                                    // Avoid the Windows menu fade path, which
+                                    // can leave a blank surface until hover.
+                                    (TPM_RETURNCMD | TPM_NOANIMATION).0,
                                     pt.x,
                                     pt.y,
                                     hwnd,
                                     None,
                                 );
+                                cancel_menu_paint(hwnd);
+                                // Complete notification-area menu dismissal
+                                // before a subsequent click starts another menu.
+                                let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
                                 let _ = DestroyMenu(h_menu);
 
                                 if let Some(ref tx) = *EVENT_SENDER.lock() {
@@ -192,6 +224,28 @@ impl SystemTrayManager {
                         }
                         LRESULT(0)
                     }
+                    WM_INITMENUPOPUP => {
+                        // Native submenus may validate their first paint before
+                        // their surface is ready. Defer one repaint past menu
+                        // initialization; this also covers each newly opened submenu.
+                        cancel_menu_paint(hwnd);
+                        // KillTimer leaves already queued WM_TIMER messages in
+                        // the queue. A new ID prevents an old popup's message
+                        // from canceling a newly opened popup's repaint.
+                        let timer = MENU_PAINT_SERIAL.get().wrapping_add(1).max(1);
+                        MENU_PAINT_SERIAL.set(timer);
+                        MENU_PAINT_TIMER.set(SetTimer(Some(hwnd), timer, 250, None));
+                        DefWindowProcW(hwnd, msg, wparam, lparam)
+                    }
+                    WM_TIMER if wparam.0 != 0 && wparam.0 == MENU_PAINT_TIMER.get() => {
+                        cancel_menu_paint(hwnd);
+                        let _ = EnumThreadWindows(
+                            windows::Win32::System::Threading::GetCurrentThreadId(),
+                            Some(paint_visible_menu),
+                            LPARAM(0),
+                        );
+                        LRESULT(0)
+                    }
                     WM_CLOSE => {
                         let mut nid = NOTIFYICONDATAW {
                             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -219,7 +273,7 @@ impl SystemTrayManager {
             RegisterClassW(&wc);
 
             let hwnd_res = CreateWindowExW(
-                WINDOW_EX_STYLE::default(),
+                WS_EX_TOOLWINDOW,
                 class_name,
                 w!("MimonitorTrayWindow"),
                 WS_OVERLAPPED,

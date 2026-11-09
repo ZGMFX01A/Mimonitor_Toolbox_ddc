@@ -1,4 +1,6 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// GUI launches (including login startup) must never allocate a console, even
+// when a locally built debug executable is registered for autostart.
+#![windows_subsystem = "windows"]
 
 #[cfg(all(not(debug_assertions), target_env = "msvc", not(target_feature = "crt-static")))]
 compile_error!("Release builds require the static CRT configured in .cargo/config.toml");
@@ -1599,6 +1601,9 @@ fn main() {
             WindowOptions {
                 show: false,
                 focus: false,
+                // GPUI's normal Windows windows use WS_EX_APPWINDOW. The
+                // keep-alive window must never become a taskbar/Alt-Tab entry.
+                kind: gpui::WindowKind::PopUp,
                 titlebar: None,
                 is_resizable: false,
                 ..Default::default()
@@ -1683,6 +1688,14 @@ fn main() {
                             let behavior = state_close.read(cx).config.close_behavior;
                             match behavior {
                                 crate::config::CloseBehavior::Tray => {
+                                    // Hide synchronously: GPUI destroys the HWND
+                                    // on its executor after this close callback.
+                                    if let Some(hwnd) = native_window(window) {
+                                        unsafe {
+                                            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+                                            let _ = ShowWindow(hwnd, SW_HIDE);
+                                        }
+                                    }
                                     *handle_close.lock() = None;
                                     window.remove_window();
                                     false
