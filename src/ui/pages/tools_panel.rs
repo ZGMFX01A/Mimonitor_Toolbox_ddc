@@ -27,7 +27,7 @@ pub struct ToolsPage {
     terminal_expanded: bool,
 }
 pub fn save_patch(bus: Arc<MessageBus>, patch: HashMap<String, serde_json::Value>) {
-    std::thread::spawn(move || match crate::config::patch_settings(patch) {
+    crate::lifecycle::spawn_ui_task(move || match crate::config::patch_settings(patch) {
         Ok(config) => {
             let _ = bus
                 .event_sender
@@ -548,28 +548,10 @@ impl Render for ToolsPage {
                             if shell && disabled {
                                 return;
                             }
-                            use std::os::windows::process::CommandExt;
                             let adb = crate::adb::get_bundled_adb_path();
-                            let directory =
-                                adb.parent().unwrap_or_else(|| std::path::Path::new("."));
                             let serial = this.connected_serial.clone().unwrap_or_default();
                             if shell && serial.is_empty() { return; }
-                            let text = if shell {
-                                r#""%MIMONITOR_ADB_BIN%" -P %MIMONITOR_ADB_PORT% -s %MIMONITOR_ADB_SERIAL% shell"#
-                            } else {
-                                r#"doskey adb=adb.exe -P %MIMONITOR_ADB_PORT% $*"#
-                            };
-                            if let Err(error) = std::process::Command::new("cmd.exe")
-                                .args(["/k", text])
-                                .current_dir(directory)
-                                .env("MIMONITOR_ADB_BIN", &adb)
-                                .env(
-                                    "MIMONITOR_ADB_PORT",
-                                    crate::adb::get_adb_server_port().to_string(),
-                                )
-                                .env("MIMONITOR_ADB_SERIAL", serial)
-                                .creation_flags(0x10)
-                                .spawn()
+                            if let Err(error) = crate::process_io::open_adb_console(&adb, &serial, shell)
                             {
                                 this.report = format!("无法打开终端：{error}");
                                 cx.notify();
@@ -644,7 +626,7 @@ impl Render for ToolsPage {
             .id("autostart")
             .on_click(cx.listener(move |this, _, _, _| {
                 let bus = this.bus.clone();
-                std::thread::spawn(move || {
+                crate::lifecycle::spawn_ui_task(move || {
                     match crate::config::system::set_autostart(!autostart) {
                         Ok(()) => save_patch(
                             bus,
@@ -1068,7 +1050,7 @@ impl Render for ToolsPage {
                         .id("export-log")
                         .on_click(cx.listener(|this, _, _, _| {
                             let bus = this.bus.clone();
-                            std::thread::spawn(move || {
+                            crate::lifecycle::spawn_ui_task(move || {
                                 let dir = crate::config::get_app_data_dir().join("exports");
                                 let result = std::fs::create_dir_all(&dir).and_then(|_| {
                                     let path = dir.join(format!(
@@ -1116,9 +1098,13 @@ impl Render for ToolsPage {
                     .id("third-party-notices")
                     .on_click(cx.listener(|this, _, _, _| {
                         let bus = this.bus.clone();
-                        std::thread::spawn(move || {
+                        crate::lifecycle::spawn_ui_task(move || {
                             let result = crate::resources::license_directory().and_then(|directory| {
-                                std::process::Command::new("explorer.exe").arg(directory).spawn()
+                                std::process::Command::new("explorer.exe").arg(directory)
+                                    .stdin(std::process::Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .spawn()
                                     .map(|_| ()).map_err(|error| error.to_string())
                             });
                             if let Err(error) = result {

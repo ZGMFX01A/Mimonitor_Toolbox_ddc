@@ -1,4 +1,4 @@
-//! One GUI process per Windows user/session, with activation of a tray-resident instance.
+//! One resident backend per Windows user/session, with activation of its UI child.
 use std::hash::{DefaultHasher, Hash, Hasher};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, ERROR_ALREADY_EXISTS, WAIT_OBJECT_0};
@@ -25,6 +25,10 @@ impl Instance {
     pub fn acquire(tray: bool, brightness: bool) -> windows::core::Result<Option<Self>> {
         let mut hash = DefaultHasher::new();
         std::env::var_os("USERPROFILE").hash(&mut hash);
+        // Explicit test/portable profiles must not activate the user's real app.
+        if let Some(path) = std::env::var_os("MIMONITOR_SETTINGS_PATH") {
+            path.hash(&mut hash);
+        }
         Self::acquire_named(&format!("Local\\MimonitorToolbox.{:x}", hash.finish()), tray, brightness)
     }
 

@@ -90,13 +90,24 @@ pub(crate) mod win32_job {
 
     impl JobGuard {
         pub fn new() -> Option<Self> {
+            Self::with_limits(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+        }
+
+        /// Explorer/browser windows opened by the UI may outlive the panel.
+        pub fn ui_process() -> Option<Self> {
+            const JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK: u32 = 0x1000;
+            Self::with_limits(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
+        }
+
+        fn with_limits(limits: u32) -> Option<Self> {
             let h = unsafe { CreateJobObjectW(null(), null()) };
             if h.is_null() {
                 return None;
             }
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            // 严格无 breakaway，确保所有通过客户端衍生（如 mock cmd/powershell）的子孙进程一律被捕获，并在关闭/超时时彻底被杀
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // ADB keeps strict inheritance. The UI itself is protected while
+            // unrelated shell helpers may leave its job.
+            info.BasicLimitInformation.LimitFlags = limits;
             let ok = unsafe {
                 SetInformationJobObject(
                     h,
@@ -336,7 +347,7 @@ impl Drop for AdbLifetime {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AdbDeviceState {
     Device,
     Offline,

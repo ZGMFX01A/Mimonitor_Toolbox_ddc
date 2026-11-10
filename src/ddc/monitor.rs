@@ -52,7 +52,7 @@ pub struct DdcMonitorInfo {
 }
 
 /// 原始 Windows 显示器枚举项
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RawDisplayItem {
     pub device_name: String,
     pub device_id: String,

@@ -7,7 +7,7 @@ use crate::device::source::VideoSource;
 use crate::presets::ApplyResult;
 
 /// 界面向后台工作管道提交的强类型业务指令（均携带会话或代数标识）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AppCommand {
     EditPresetConfig { mutation: preset_sync::PresetConfigMutation, request_id: u64 },
     TrayValueCommit {
@@ -171,7 +171,7 @@ pub enum AppCommand {
 }
 
 /// 后台向界面通知的异步业务事件
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AppEvent {
     PresetConfigResult {
         request_id: u64,

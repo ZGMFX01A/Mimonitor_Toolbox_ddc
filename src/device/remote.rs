@@ -1,7 +1,7 @@
 use crate::adb::{AdbDevice, AdbError};
 
 /// Android 虚拟遥控器 Keycode 常量
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RemoteKey {
     DpadUp = 19,
     DpadDown = 20,

@@ -26,6 +26,7 @@ pub enum ConfigError {
     Io(std::io::Error),
     Serialize(serde_json::Error),
     BackupFailed(String),
+    Conflict(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -34,6 +35,7 @@ impl fmt::Display for ConfigError {
             ConfigError::Io(e) => write!(f, "配置 IO 失败: {}", e),
             ConfigError::Serialize(e) => write!(f, "配置序列化失败: {}", e),
             ConfigError::BackupFailed(msg) => write!(f, "配置文件备份失败: {}", msg),
+            ConfigError::Conflict(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -344,6 +346,9 @@ pub fn load_settings() -> Arc<AppConfig> {
 
 /// 保存并更新配置
 pub fn save_settings(config: &AppConfig) -> Result<(), ConfigError> {
+    if crate::lifecycle::ui_client().is_some() {
+        return Err(ConfigError::Io(std::io::Error::other("界面进程必须通过后台更新配置")));
+    }
     if migration_blocked() {
         return Err(ConfigError::BackupFailed(
             "旧配置备份未成功，当前为只读模式；修复备份目录权限后重启".into(),
@@ -358,18 +363,42 @@ pub fn save_settings(config: &AppConfig) -> Result<(), ConfigError> {
 
 /// Serialize read-modify-save operations so independent pages preserve one another's fields.
 pub fn update_settings(update: impl FnOnce(&mut AppConfig)) -> Result<Arc<AppConfig>, ConfigError> {
+    update_checked(|config| { update(config); Ok(()) })
+}
+
+pub(crate) fn update_checked(update: impl FnOnce(&mut AppConfig) -> Result<(), ConfigError>) -> Result<Arc<AppConfig>, ConfigError> {
     let _guard = CONFIG_UPDATE_LOCK.lock();
-    let mut config = (*load_settings()).clone();
-    update(&mut config);
-    save_settings(&config)?;
-    Ok(Arc::new(config))
+    let before = load_settings();
+    let mut config = (*before).clone();
+    update(&mut config)?;
+    commit_update(&before, &config)
+}
+
+pub(crate) fn install_snapshot(config: AppConfig, blocked: bool) {
+    MIGRATION_BLOCKED.store(blocked, Ordering::Release);
+    *CONFIG_INSTANCE.write() = Some(Arc::new(config));
+}
+
+fn commit_update(before: &AppConfig, after: &AppConfig) -> Result<Arc<AppConfig>, ConfigError> {
+    if let Some(client) = crate::lifecycle::ui_client() {
+        client.save_config(before, after).map_err(|error| {
+            ConfigError::Io(std::io::Error::other(error))
+        })?;
+        // The pipe reader installs replies in stream order. Do not overwrite a
+        // newer background update which may have arrived after this reply.
+        Ok(load_settings())
+    } else {
+        save_settings(after)?;
+        Ok(Arc::new(after.clone()))
+    }
 }
 
 pub fn patch_settings(
     patch: std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<Arc<AppConfig>, ConfigError> {
     let _guard = CONFIG_UPDATE_LOCK.lock();
-    let mut value = serde_json::to_value(&*load_settings())?;
+    let before = load_settings();
+    let mut value = serde_json::to_value(&*before)?;
     let object = value
         .as_object_mut()
         .expect("configuration serializes to an object");
@@ -377,8 +406,7 @@ pub fn patch_settings(
         object.insert(key, value);
     }
     let config: AppConfig = serde_json::from_value(value)?;
-    save_settings(&config)?;
-    Ok(Arc::new(config))
+    commit_update(&before, &config)
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 use crate::adb::AdbDevice;
 use crate::device::{guardian as g, mode_4k as m, picture as p};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ToolAction {
     Shell(String),
     InstallApk(String),

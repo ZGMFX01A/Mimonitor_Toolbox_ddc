@@ -140,7 +140,7 @@ pub fn apply_preset_values_to_config(
 
 /// Field-level edits are queued with device work, so stale UI snapshots cannot
 /// replace a newer automatically captured preset or resurrect a deleted entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum PresetConfigMutation {
     AddAndActivate { preset: crate::config::PresetItem, generation: u64 },
     UpdateValues { id: String, values: HashMap<String, serde_json::Value>, generation: u64 },

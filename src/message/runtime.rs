@@ -31,6 +31,10 @@ impl SessionGeneration {
         let _guard = self.commit_gate.lock();
         self.value.fetch_add(value, order)
     }
+    pub(crate) fn advance_to(&self, value: u64) {
+        let _guard = self.commit_gate.lock();
+        self.value.fetch_max(value, Ordering::AcqRel);
+    }
     pub fn with_current<T>(&self, generation: u64, commit: impl FnOnce() -> T) -> Option<T> {
         let _guard = self.commit_gate.lock();
         (self.value.load(Ordering::Acquire) == generation).then(commit)
@@ -214,6 +218,7 @@ fn generation(command: &AppCommand) -> Option<u64> {
 
 #[derive(Clone)]
 pub struct CommandSender {
+    remote: Option<std::sync::mpsc::SyncSender<crate::lifecycle::UiRequest>>,
     adb: Arc<Inbox>,
     ddc: Arc<Inbox>,
     scan: Arc<Inbox>,
@@ -307,6 +312,14 @@ impl CommandSender {
             }
             _ => {}
         }
+        if let Some(remote) = &self.remote {
+            return remote.try_send(crate::lifecycle::UiRequest::Command(command))
+                .map_err(|error| match error {
+                    std::sync::mpsc::TrySendError::Full(crate::lifecycle::UiRequest::Command(command))
+                    | std::sync::mpsc::TrySendError::Disconnected(crate::lifecycle::UiRequest::Command(command)) => SendError(command),
+                    _ => unreachable!(),
+                });
+        }
         let queue = match &command {
             AppCommand::RefreshMonitors | AppCommand::SetDdcBrightness { .. } => &self.ddc,
             AppCommand::ScanNetworkDevices { .. } | AppCommand::CancelScan => &self.scan,
@@ -343,11 +356,22 @@ impl Default for MessageBus {
 }
 impl MessageBus {
     pub fn new() -> Self {
+        Self::create(None)
+    }
+
+    /// A UI owns only a command proxy and event inbox, never hardware workers.
+    pub(crate) fn remote(sender: std::sync::mpsc::SyncSender<crate::lifecycle::UiRequest>) -> Self {
+        Self::create(Some(sender))
+    }
+
+    fn create(remote: Option<std::sync::mpsc::SyncSender<crate::lifecycle::UiRequest>>) -> Self {
+        let is_remote = remote.is_some();
         let (tx, rx) = channel();
         let adb = Arc::new(Inbox { events: Some(tx.clone()), ..Inbox::default() });
         let ddc = Arc::new(Inbox::default());
         let scan = Arc::new(Inbox::default());
         let sender = CommandSender {
+            remote,
             adb: adb.clone(),
             ddc: ddc.clone(),
             scan: scan.clone(),
@@ -374,6 +398,9 @@ impl MessageBus {
             is_shutdown: sender.stopped.clone(),
             workers: Arc::new(Mutex::new(Vec::new())),
         };
+        if is_remote {
+            return bus;
+        }
         let tx_ddc = tx.clone();
         let stop = bus.is_shutdown.clone();
         bus.workers.lock().push(thread::spawn(move || {
@@ -458,6 +485,10 @@ impl MessageBus {
         let _ = self.cmd_sender.send(AppCommand::CancelScan);
     }
     pub fn shutdown(&self) {
+        if self.cmd_sender.remote.is_some() {
+            self.is_shutdown.store(true, Ordering::Release);
+            return;
+        }
         if self.is_shutdown.swap(true, Ordering::AcqRel) {
             return;
         }

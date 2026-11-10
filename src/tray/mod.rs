@@ -348,6 +348,13 @@ impl SystemTrayManager {
         let rx = self.event_receiver.lock();
         rx.try_recv().ok()
     }
+
+    /// The UI process uses the same dispatcher without creating a second tray.
+    pub fn dispatch(&self, event: TrayEvent) {
+        if let Some(sender) = EVENT_SENDER.lock().as_ref() {
+            let _ = sender.send(event);
+        }
+    }
 }
 
 impl Drop for SystemTrayManager {

@@ -135,7 +135,7 @@ impl GamePage {
     fn save_current_config(&self) {
         let cfg = self.config.clone();
         let bus = self.bus.clone();
-        std::thread::spawn(move || {
+        crate::lifecycle::spawn_ui_task(move || {
             if let Err(error) = crate::config::update_settings(|current| {
                 current.crosshair_game_mode_only = cfg.crosshair_game_mode_only;
                 current.crosshair_memory = cfg.crosshair_memory;

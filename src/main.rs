@@ -11,6 +11,8 @@ pub mod ddc;
 pub mod device;
 pub mod hotkey;
 mod instance;
+mod lifecycle;
+mod process_io;
 pub mod logger;
 pub mod message;
 pub mod presets;
@@ -42,6 +44,51 @@ use crate::ui::pages::*;
 use crate::ui::theme::ThemeColors;
 use crate::ui::tray_popup::TrayBrightnessPopupView;
 use crate::ui::tray_value_popup::TrayValuePopupView;
+
+fn update_osd_window(
+    cx: &mut App, bus: &Arc<MessageBus>,
+    osd_handle: &Arc<Mutex<Option<gpui::WindowHandle<crate::ui::osd::Osd>>>>,
+    message: &Option<String>,
+) {
+    let existing = *osd_handle.lock();
+    if let Some(message) = message {
+        if let Some(handle) = existing {
+            if handle
+                .update(cx, |view, _, cx| {
+                    view.message = message.clone();
+                    cx.notify();
+                })
+                .is_ok()
+            {
+                return;
+            }
+        }
+        let origin = get_tray_popup_origin_with_size(320.0, 130.0);
+        let bus = bus.clone();
+        let message = message.clone();
+        if let Ok(handle) = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(
+                    Bounds::new(origin, size(px(320.0), px(130.0))),
+                )),
+                kind: gpui::WindowKind::PopUp,
+                titlebar: None,
+                is_resizable: false,
+                focus: false,
+                ..Default::default()
+            },
+            |_, cx| cx.new(|_| crate::ui::osd::Osd::new(message, bus)),
+        ) {
+            *osd_handle.lock() = Some(handle);
+        }
+    } else {
+        if let Some(handle) = existing {
+            let _ = handle
+                .update(cx, |_, window, _| window.remove_window());
+        }
+        *osd_handle.lock() = None;
+    }
+}
 
 fn monitor_ip(input: &str) -> Result<String, &'static str> {
     let raw = input.trim();
@@ -218,7 +265,7 @@ impl AppState {
         self.toast = None;
         let ip_to_save = ip.clone();
         let save_bus = bus.clone();
-        std::thread::spawn(move || {
+        crate::lifecycle::spawn_ui_task(move || {
             if let Err(error) = crate::config::update_settings(|cfg| cfg.saved_ip = ip_to_save) {
                 let _ = save_bus.event_sender.send(AppEvent::ToastNotification {
                     message: format!("保存连接地址失败：{error}"), is_error: true,
@@ -1485,16 +1532,11 @@ fn get_tray_popup_origin() -> Point<Pixels> {
     get_tray_popup_origin_with_size(320.0, 440.0)
 }
 
-/// 永久隐藏的 Anchor View，用于在主窗口关闭到托盘时保持 GPUI 运行时存活
-struct AnchorView;
-
-impl Render for AnchorView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-    }
-}
-
 fn main() {
+    if std::env::args().any(|arg| arg == "--ui-process") {
+        if let Err(error) = lifecycle::run_ui_process() { eprintln!("UI startup failed: {error}"); }
+        return;
+    }
     let _adb_lifetime = adb::client::AdbLifetime;
     let args: Vec<String> = std::env::args().collect();
 
@@ -1594,23 +1636,22 @@ fn main() {
     let tray_manager = Arc::new(SystemTrayManager::new());
     tray_manager.start();
 
-    // 4. 启动 GPUI 应用程序
-    Application::new().run(move |cx: &mut App| {
-        // 创建永久隐藏的 anchor 窗口，保持 GPUI 事件循环存活（防止主窗口关闭到托盘或弹窗失焦移除时作为最后窗口触发 PostQuitMessage）
-        let _ = cx.open_window(
-            WindowOptions {
-                show: false,
-                focus: false,
-                // GPUI's normal Windows windows use WS_EX_APPWINDOW. The
-                // keep-alive window must never become a taskbar/Alt-Tab entry.
-                kind: gpui::WindowKind::PopUp,
-                titlebar: None,
-                is_resizable: false,
-                ..Default::default()
-            },
-            |_window, cx| cx.new(|_cx| AnchorView),
-        );
+    let initial = if is_open_brightness {
+        Some(lifecycle::UiAction::Brightness)
+    } else if !start_in_tray {
+        Some(lifecycle::UiAction::Main)
+    } else { None };
+    lifecycle::run_background(instance, bus, tray_manager, initial);
+}
 
+/// Only the on-demand UI child enters GPUI. The backend never initializes it.
+fn run_ui_application(
+    bus: Arc<MessageBus>, tray_manager: Arc<SystemTrayManager>, config: Arc<AppConfig>,
+    activation: lifecycle::Activation,
+    actions: std::sync::mpsc::Receiver<lifecycle::Activation>,
+) {
+    crate::ui::theme::set_preference(config.extra.get("theme").and_then(|v| v.as_str()).unwrap_or("dark"));
+    Application::new().run(move |cx: &mut App| {
         // 绑定全局文本快捷键 (Ctrl+A, Ctrl+C, Ctrl+V 等)
         logger::log_info("GPUI 运行时已进入");
         bind_text_input_keys(cx);
@@ -1684,24 +1725,19 @@ fn main() {
                         let bus_for_exit = bus_close.clone();
                         let tray_for_exit = tray_close.clone();
 
-                        window.on_window_should_close(cx, move |window, cx| {
+                        window.on_window_should_close(cx, move |_window, cx| {
                             let behavior = state_close.read(cx).config.close_behavior;
                             match behavior {
                                 crate::config::CloseBehavior::Tray => {
-                                    // Hide synchronously: GPUI destroys the HWND
-                                    // on its executor after this close callback.
-                                    if let Some(hwnd) = native_window(window) {
-                                        unsafe {
-                                            use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-                                            let _ = ShowWindow(hwnd, SW_HIDE);
-                                        }
-                                    }
                                     *handle_close.lock() = None;
-                                    window.remove_window();
+                                    // Close the UI process, including all page entities and
+                                    // GPU resources. The resident backend stays alive.
+                                    cx.quit();
                                     false
                                 }
                                 crate::config::CloseBehavior::Exit => {
                                     *handle_close.lock() = None;
+                                    lifecycle::request_exit();
                                     bus_for_exit.shutdown();
                                     tray_for_exit.shutdown();
                                     cx.quit();
@@ -1951,23 +1987,13 @@ fn main() {
             }
         };
 
-        // 如果启动参数包含 --open-brightness，直接打开托盘亮度面板
-        if is_open_brightness {
-            toggle_tray_popup(cx);
-        } else if !start_in_tray {
-            open_main_window(cx);
+        match activation.action {
+            lifecycle::UiAction::Main => open_main_window(cx),
+            lifecycle::UiAction::Brightness => toggle_tray_popup(cx),
+            lifecycle::UiAction::Value(param) => open_value_popup(param, cx),
+            lifecycle::UiAction::Osd(message) => update_osd_window(cx, &bus, &osd_handle, &Some(message)),
         }
-        if !config.saved_ip.trim().is_empty() {
-            let generation = bus.active_generation.load(Ordering::Acquire);
-            app_state.update(cx, |state, cx| {
-                state.is_adb_connecting = true;
-                cx.notify();
-            });
-            let _ = bus.cmd_sender.send(AppCommand::ConnectAdb {
-                ip: config.saved_ip.clone(),
-                generation,
-            });
-        }
+        if let Some(client) = lifecycle::ui_client() { let _ = client.send(lifecycle::UiRequest::Activated(activation.id)); }
 
         // 后台总线事件与托盘事件桥接泵 (每 40ms 轮询一次事件队列并安全驱动 GPUI 主线程更新)
         let bus_pump = bus.clone();
@@ -1983,11 +2009,18 @@ fn main() {
         cx.foreground_executor()
             .spawn(async move {
                 loop {
-                    if instance.take_main() {
-                        let _ = async_cx.update(|cx| (open_main_for_pump.lock())(cx));
-                    }
-                    if instance.take_brightness() {
-                        let _ = async_cx.update(|cx| (toggle_popup_for_pump.lock())(cx));
+                    for _ in 0..64 {
+                        let Ok(activation) = actions.try_recv() else { break; };
+                        let id = activation.id;
+                        let applied = async_cx.update(|cx| match activation.action {
+                            lifecycle::UiAction::Main => (open_main_for_pump.lock())(cx),
+                            lifecycle::UiAction::Brightness => (toggle_popup_for_pump.lock())(cx),
+                            lifecycle::UiAction::Value(param) => (open_value_popup_for_pump.lock())(param, cx),
+                            lifecycle::UiAction::Osd(message) => update_osd_window(cx, &bus_pump, &osd_handle, &Some(message)),
+                        });
+                        if applied.is_ok() {
+                            if let Some(client) = lifecycle::ui_client() { let _ = client.send(lifecycle::UiRequest::Activated(id)); }
+                        }
                     }
                     // 0. 托盘面板失焦自动关闭检查（失焦关闭并清空 storage，下次点击立即可重新打开）
                     let popup_handle_opt = {
@@ -2054,46 +2087,7 @@ fn main() {
                             continue;
                         }
                         if let AppEvent::HotkeyOsd { message } = &evt {
-                            let _ = async_cx.update(|cx| {
-                                let existing = *osd_handle.lock();
-                                if let Some(message) = message {
-                                    if let Some(handle) = existing {
-                                        if handle
-                                            .update(cx, |view, _, cx| {
-                                                view.message = message.clone();
-                                                cx.notify();
-                                            })
-                                            .is_ok()
-                                        {
-                                            return;
-                                        }
-                                    }
-                                    let origin = get_tray_popup_origin_with_size(320.0, 130.0);
-                                    let bus = bus_pump.clone();
-                                    let message = message.clone();
-                                    if let Ok(handle) = cx.open_window(
-                                        WindowOptions {
-                                            window_bounds: Some(WindowBounds::Windowed(
-                                                Bounds::new(origin, size(px(320.0), px(130.0))),
-                                            )),
-                                            kind: gpui::WindowKind::PopUp,
-                                            titlebar: None,
-                                            is_resizable: false,
-                                            focus: false,
-                                            ..Default::default()
-                                        },
-                                        |_, cx| cx.new(|_| crate::ui::osd::Osd::new(message, bus)),
-                                    ) {
-                                        *osd_handle.lock() = Some(handle);
-                                    }
-                                } else {
-                                    if let Some(handle) = existing {
-                                        let _ = handle
-                                            .update(cx, |_, window, _| window.remove_window());
-                                    }
-                                    *osd_handle.lock() = None;
-                                }
-                            });
+                            let _ = async_cx.update(|cx| update_osd_window(cx, &bus_pump, &osd_handle, message));
                             continue;
                         }
                         if matches!(evt, AppEvent::AdbStateChanged { .. }) {
@@ -2432,7 +2426,8 @@ fn main() {
                                     cx.notify();
                                 }
                                 AppEvent::HotkeyOsd { .. } => {}
-                                AppEvent::ConfigUpdated(config) => {
+                                AppEvent::ConfigUpdated(_) => {
+                                    let config = (*crate::config::load_settings()).clone();
                                     crate::ui::theme::set_preference(
                                         config
                                             .extra

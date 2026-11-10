@@ -13,7 +13,7 @@ const IF_TYPE_ETHERNET_CSMACD: u32 = 6;
 const IF_TYPE_IEEE80211: u32 = 71;
 const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DiscoveredDevice {
     pub ip: String,
     pub model: String,

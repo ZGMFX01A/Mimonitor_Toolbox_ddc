@@ -52,7 +52,8 @@ fn append_entry(category: &str, msg: &str) {
     let line = format!("[{}] [{}] {}\n", timestamp, category, msg);
 
     // 控制台输出
-    print!("{}", line);
+    // stdout is reserved for the private parent/UI protocol in UI processes.
+    eprint!("{}", line);
 
     // 写入 app.log
     let app_log_path = get_log_dir().join("app.log");

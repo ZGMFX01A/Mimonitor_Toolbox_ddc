@@ -216,7 +216,7 @@ impl AdjustDirection {
 }
 
 /// 触发的快捷键事件（交由宿主消费，不在此做 ADB）
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HotkeyEvent {
     Cycle(CycleAction),
     Adjust {

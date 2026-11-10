@@ -22,7 +22,7 @@ pub const EXPECTED_APPCONTROL_MASK: &str = "-134250497";
 pub const EXPECTED_ADB_PORT: &str = "5555";
 
 /// AdbGuardian 完整状态，对齐原 Python mimonitor_toolbox 10 项细粒度指标
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GuardianStatus {
     /// 是否已安装该 APK (pm path com.example.adbguardian)
     pub installed: bool,
