@@ -2185,6 +2185,13 @@ fn run_ui_application(
                                         st.adb_model = model;
                                         st.is_adb_connecting = false;
                                         if state.is_connected() {
+                                            // The initial panel can open before startup events are applied.
+                                            // Retry after connection replay if no backlight has arrived yet.
+                                            if st.adb_backlight.is_none() {
+                                                let _ = bus_pump.cmd_sender.send(
+                                                    AppCommand::FetchBacklight { generation },
+                                                );
+                                            }
                                             st.light_state.is_reading = true;
                                             let rev = st.light_state.last_revision + 1;
                                             st.light_state.last_revision = rev;

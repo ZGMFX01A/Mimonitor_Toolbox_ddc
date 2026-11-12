@@ -72,8 +72,7 @@ impl TrayBrightnessPopupView {
         view.sync_from_app_state(&app_state, cx);
 
         // 构造时不执行同步 IO，向后台总线发送异步刷新命令
-        let bus = view.app_state.read(cx).bus.clone();
-        let _ = bus.cmd_sender.send(AppCommand::RefreshMonitors);
+        view.refresh_monitors(cx);
 
         view
     }
@@ -169,8 +168,14 @@ impl TrayBrightnessPopupView {
     pub fn refresh_monitors(&mut self, cx: &mut Context<Self>) {
         self.is_refreshing = true;
         self.status_msg = Some("正在后台异步刷新显示器...".to_string());
-        let bus = self.app_state.read(cx).bus.clone();
+        let state = self.app_state.read(cx);
+        let bus = state.bus.clone();
         let _ = bus.cmd_sender.send(AppCommand::RefreshMonitors);
+        if state.adb_state.is_connected() {
+            let _ = bus.cmd_sender.send(AppCommand::FetchBacklight {
+                generation: bus.active_generation.load(Ordering::Acquire),
+            });
+        }
         cx.notify();
     }
 }

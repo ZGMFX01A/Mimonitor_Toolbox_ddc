@@ -510,6 +510,7 @@ impl UiChild {
 #[derive(Default)]
 struct Snapshot {
     connection: Option<AppEvent>,
+    backlight: Option<AppEvent>,
     displays: Option<AppEvent>,
     monitors: Option<AppEvent>,
     activity: Option<AppEvent>,
@@ -517,7 +518,26 @@ struct Snapshot {
 impl Snapshot {
     fn record(&mut self, event: &AppEvent) {
         match event {
-            AppEvent::AdbStateChanged { .. } => self.connection = Some(event.clone()),
+            AppEvent::AdbStateChanged { state, generation, .. } => {
+                let same_session = matches!(self.connection.as_ref(),
+                    Some(AppEvent::AdbStateChanged { generation: previous, .. })
+                        if previous == generation);
+                if !state.is_connected() || !same_session {
+                    self.backlight = None;
+                }
+                self.connection = Some(event.clone());
+            }
+            AppEvent::BacklightUpdated { generation, revision, .. } => {
+                let connected = matches!(self.connection.as_ref(),
+                    Some(AppEvent::AdbStateChanged { state, generation: current, .. })
+                        if state.is_connected() && current == generation);
+                let outdated = matches!(self.backlight.as_ref(),
+                    Some(AppEvent::BacklightUpdated { revision: previous, .. })
+                        if revision < previous);
+                if connected && !outdated {
+                    self.backlight = Some(event.clone());
+                }
+            }
             AppEvent::WindowsDisplaysDiscovered(_) => self.displays = Some(event.clone()),
             AppEvent::DdcMonitorsDiscovered(_) => self.monitors = Some(event.clone()),
             AppEvent::DeviceActivity { active, .. } => {
@@ -541,6 +561,7 @@ impl Snapshot {
     fn events(&self) -> Vec<AppEvent> {
         self.connection
             .iter()
+            .chain(self.backlight.iter())
             .chain(self.displays.iter())
             .chain(self.monitors.iter())
             .chain(self.activity.iter())
@@ -739,6 +760,79 @@ pub(crate) fn run_background(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_replays_backlight_after_connection_when_ui_reopens() {
+        let mut snapshot = Snapshot::default();
+        snapshot.record(&AppEvent::AdbStateChanged {
+            ip: "192.168.5.19".into(),
+            state: crate::adb::AdbDeviceState::Device,
+            model: "MiTV-MFFU1".into(),
+            generation: 4,
+        });
+        snapshot.record(&AppEvent::BacklightUpdated {
+            value: Some(15), generation: 4, revision: 9,
+        });
+        for _ in 0..2 {
+            let events = snapshot.events();
+            assert!(matches!(events.first(), Some(AppEvent::AdbStateChanged { generation: 4, .. })));
+            assert!(matches!(events.get(1), Some(AppEvent::BacklightUpdated {
+                value: Some(15), generation: 4, revision: 9,
+            })), "reopened UI must receive the backlight already read by the backend");
+        }
+    }
+
+    #[test]
+    fn snapshot_keeps_latest_backlight_and_rejects_other_sessions() {
+        let mut snapshot = Snapshot::default();
+        snapshot.record(&AppEvent::AdbStateChanged {
+            ip: "192.168.5.19".into(),
+            state: crate::adb::AdbDeviceState::Device,
+            model: "MiTV-MFFU1".into(),
+            generation: 4,
+        });
+        for (value, generation, revision) in [
+            (Some(15), 4, 9), (Some(20), 4, 10), (Some(15), 4, 9),
+            (Some(80), 3, 11), (Some(90), 5, 12),
+        ] {
+            snapshot.record(&AppEvent::BacklightUpdated { value, generation, revision });
+        }
+        assert!(matches!(snapshot.events().get(1), Some(AppEvent::BacklightUpdated {
+            value: Some(20), generation: 4, revision: 10,
+        })));
+        snapshot.record(&AppEvent::BacklightUpdated { value: None, generation: 4, revision: 11 });
+        assert!(matches!(snapshot.events().get(1), Some(AppEvent::BacklightUpdated {
+            value: None, generation: 4, revision: 11,
+        })));
+    }
+
+    #[test]
+    fn snapshot_clears_backlight_on_disconnect_or_new_session() {
+        let connection = |generation, state| AppEvent::AdbStateChanged {
+            ip: "192.168.5.19".into(), state, model: "MiTV-MFFU1".into(), generation,
+        };
+        let reading = |generation| AppEvent::BacklightUpdated {
+            value: Some(15), generation, revision: 9,
+        };
+        let mut snapshot = Snapshot::default();
+        snapshot.record(&reading(4));
+        assert!(snapshot.events().is_empty());
+        snapshot.record(&connection(4, crate::adb::AdbDeviceState::Device));
+        snapshot.record(&reading(4));
+        snapshot.record(&connection(4, crate::adb::AdbDeviceState::Device));
+        assert_eq!(snapshot.events().len(), 2);
+        snapshot.record(&connection(4, crate::adb::AdbDeviceState::Offline));
+        snapshot.record(&reading(4));
+        assert_eq!(snapshot.events().len(), 1);
+        snapshot.record(&connection(4, crate::adb::AdbDeviceState::Device));
+        assert_eq!(snapshot.events().len(), 1);
+        snapshot.record(&reading(4));
+        snapshot.record(&connection(5, crate::adb::AdbDeviceState::Device));
+        snapshot.record(&reading(4));
+        assert_eq!(snapshot.events().len(), 1);
+        snapshot.record(&reading(5));
+        assert_eq!(snapshot.events().len(), 2);
+    }
+
     #[test]
     fn protocol_roundtrips_and_rejects_oversized_or_truncated_frames() {
         let command = UiRequest::Command(AppCommand::SetPictureSlider {
