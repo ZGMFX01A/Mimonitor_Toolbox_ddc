@@ -66,18 +66,5 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_EXE: ${{ steps.package.outputs.exe }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $tag = $env:GITHUB_REF_NAME
-          $exe = $env:RELEASE_EXE
-          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Missing executable: $exe" }
-          $notes = Join-Path '.github/release-notes' "$tag.md"
-          $releaseArgs = @('release', 'create', $tag, $exe, '--repo', $env:GH_REPO, '--verify-tag', '--title', $tag)
-          if (Test-Path -LiteralPath $notes -PathType Leaf) {
-            $releaseArgs += @('--notes-file', $notes)
-          } else {
-            $releaseArgs += '--generate-notes'
-          }
-          # gh uploads this runner's EXE before publishing the release.
-          # An existing release is never overwritten or clobbered.
-          & gh @releaseArgs
+          ./scripts/publish-release.ps1 -Tag $env:GITHUB_REF_NAME -ExePath $env:RELEASE_EXE -Repository $env:GH_REPO -CommitSha $env:GITHUB_SHA
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
