@@ -683,8 +683,8 @@ impl Render for MainWindow {
         }
         let searching = !self.search_query.trim().is_empty();
 
+        let shortcut_focus = self.focus_handle.clone();
         div()
-            .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 if this.search_input.read(cx).is_composing() { return; }
                 if event.keystroke.key == "escape" && (!this.search_query.is_empty()
@@ -710,6 +710,12 @@ impl Render for MainWindow {
             .size_full()
             .bg(rgb(ThemeColors::BG_ROOT()))
             .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
+            // Register keyboard focus without track_focus's mouse-down default prevention,
+            // which would swallow native caption buttons, dragging and border resizing.
+            .child(gpui::canvas(
+                move |_, window, cx| window.set_focus_handle(&shortcut_focus, cx),
+                |_, _, _, _| {},
+            ).absolute().size_0())
             // 顶部导航栏：合并进应用无边框体验，紧凑内边距
             .child(
                 div()
