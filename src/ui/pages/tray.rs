@@ -28,7 +28,8 @@ impl Render for TrayPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let catalog = crate::tray::catalog::catalog();
         let mut page=div().flex().flex_col().gap_4().child(div().text_xl().child("托盘菜单"))
-            .child(card_container().child("左键打开统一亮度弹窗，失去焦点自动收起。右键菜单保留工具箱、刷新和退出，可添加下列快捷控制。"));
+            .child(card_container().text_xs().child("左键打开统一亮度弹窗，失去焦点自动收起。右键菜单保留工具箱、刷新和退出，可添加下列快捷控制。"));
+        let mut selected = card_container().text_sm().child(div().text_sm().child("已添加的快捷控制"));
         for (index, key) in self.config.tray_items.clone().into_iter().enumerate() {
             let label = catalog
                 .iter()
@@ -36,8 +37,7 @@ impl Render for TrayPage {
                 .map(|entry| entry.label)
                 .unwrap_or(&key)
                 .to_string();
-            page = page.child(
-                card_container().child(
+            selected = selected.child(
                     div()
                         .flex()
                         .items_center()
@@ -74,14 +74,18 @@ impl Render for TrayPage {
                                     this.save(items);
                                 })),
                         ),
-                ),
             );
         }
+        if self.config.tray_items.is_empty() {
+            selected = selected.child(div().text_sm().child("尚未添加快捷控制，请从下方选择。"));
+        }
+        page = page.child(selected);
         let mut available = card_container().child(div().text_lg().child("添加快捷控制"));
+        let mut choices = div().flex().flex_wrap().gap_2();
         for (index, entry) in catalog.into_iter().enumerate() {
             let key = entry.id.to_string();
             let added = self.config.tray_items.contains(&key);
-            available = available.child(
+            choices = choices.child(
                 option_button(entry.label, added, added)
                     .id(("tray-add", index))
                     .on_click(cx.listener(move |this, _, _, _| {
@@ -93,6 +97,7 @@ impl Render for TrayPage {
                     })),
             );
         }
+        available = available.child(choices);
         page.child(available)
     }
 }

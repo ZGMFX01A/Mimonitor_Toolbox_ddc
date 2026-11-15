@@ -115,6 +115,8 @@ pub fn is_freesync_memory_suspended() -> bool {
 /// 真实游戏特性配置与状态（全 Option 结构，未知不默认）
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GameParameters {
+    #[serde(default)]
+    pub video_game_mode: Option<bool>,
     pub freesync: Option<bool>,
     pub mode_320: Option<bool>,
     pub front_sight_index: Option<u32>,
@@ -126,6 +128,25 @@ pub struct GameParameters {
     pub timer: Option<u32>,
     pub picture_mode: Option<i32>,
     pub current_source: Option<String>,
+}
+
+impl GameParameters {
+    /// 设备游戏开关、FreeSync 或游戏画面预设均可确认游戏状态。
+    /// 保留原编号供关闭 FreeSync 时恢复；无法确认时保持未知。
+    pub fn game_mode_active(&self) -> Option<bool> {
+        if self.video_game_mode == Some(true)
+            || self.freesync == Some(true)
+            || self.picture_mode.is_some_and(is_game_picture_mode)
+        {
+            Some(true)
+        } else if self.video_game_mode == Some(false)
+            || self.picture_mode.is_some_and(|mode| crate::device::picture::get_picture_scene_name(mode) != "未知场景")
+        {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 /// 查询设备当前 FreeSync 是否开启（兼容预设模块调用）
@@ -143,6 +164,7 @@ pub fn query_freesync_state(adb: &AdbDevice) -> Result<bool, AdbError> {
 /// 查询设备当前全部游戏特性的真实硬件/系统状态（未知不默认）
 pub fn query_game_parameters(adb: &AdbDevice) -> Result<GameParameters, AdbError> {
     let settings = adb.get_settings(&[
+        "tv_picture_video_game_mode",
         "picture_mode",
         "picture_preset_scenario",
         "front_sight_index",
@@ -225,6 +247,11 @@ pub fn query_game_parameters(adb: &AdbDevice) -> Result<GameParameters, AdbError
         .and_then(|s| s.trim().parse::<i32>().ok());
 
     Ok(GameParameters {
+        video_game_mode: settings.get("tv_picture_video_game_mode").and_then(|s| match s.trim() {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        }),
         freesync,
         mode_320,
         front_sight_index,
@@ -281,7 +308,8 @@ pub fn set_320hz(adb: &AdbDevice, enabled: bool) -> Result<(), AdbError> {
 }
 
 /// 设置准星索引 (0..5)
-/// 若当前在游戏模式中，严格执行原 Python 逻辑重触发：put 14 -> 500ms -> put 10，错误传播并回读
+/// 仅已确认的游戏画面预设执行 14 -> 500ms -> 原编号重载。
+/// 硬件游戏开关/FreeSync 开启而 Settings 保留非游戏编号时，仅刷新 PQ。
 pub fn set_front_sight(adb: &AdbDevice, index: u32, is_game_mode: bool) -> Result<(), AdbError> {
     if index > 5 {
         return Err(AdbError::CommandFailed(format!(
@@ -290,17 +318,27 @@ pub fn set_front_sight(adb: &AdbDevice, index: u32, is_game_mode: bool) -> Resul
         )));
     }
 
+    let raw_mode = if is_game_mode {
+        adb.get_setting("picture_mode")?.parse::<i32>().ok()
+    } else {
+        None
+    };
+    let reload_mode = front_sight_reload_mode(is_game_mode, raw_mode);
     adb.put_setting("front_sight_index", &index.to_string())?;
 
-    if is_game_mode {
+    if let Some(mode) = reload_mode {
         adb.put_setting("picture_mode", "14")?;
         std::thread::sleep(std::time::Duration::from_millis(500));
-        adb.put_setting("picture_mode", "10")?;
+        adb.put_setting("picture_mode", &mode.to_string())?;
     } else {
         refresh_pq(adb)?;
     }
 
     Ok(())
+}
+
+fn front_sight_reload_mode(is_game_mode: bool, raw_mode: Option<i32>) -> Option<i32> {
+    raw_mode.filter(|&mode| is_game_mode && is_game_picture_mode(mode))
 }
 
 /// 设置动态准星 (0: 关, 1: 开)
@@ -540,6 +578,59 @@ mod tests {
         assert_eq!(params.timer, None);
         assert_eq!(params.picture_mode, None);
         assert_eq!(params.current_source, None);
+    }
+
+    #[test]
+    fn game_mode_uses_freesync_hardware_state_when_picture_setting_is_stale() {
+        // 实机：picture_mode=16，但 HDMI FreeSync JNI 值为 3（已开启）。
+        let mut params = GameParameters {
+            picture_mode: Some(16), freesync: Some(true), ..Default::default()
+        };
+        assert_eq!(params.game_mode_active(), Some(true));
+        params.picture_mode = None;
+        assert_eq!(params.game_mode_active(), Some(true));
+        params.freesync = None;
+        assert_eq!(params.game_mode_active(), None);
+        params.freesync = Some(false);
+        assert_eq!(params.game_mode_active(), None);
+        params.picture_mode = Some(14);
+        assert_eq!(params.game_mode_active(), Some(false));
+        for mode in [10, 24, 25, 26, 27, 28, 15, 19, 29, 30, 31, 32, 33] {
+            params.picture_mode = Some(mode);
+            assert_eq!(params.game_mode_active(), Some(true), "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn game_mode_reads_device_switch_without_relying_on_freesync() {
+        let mut params = GameParameters {
+            video_game_mode: Some(true), picture_mode: Some(16),
+            freesync: Some(false), ..Default::default()
+        };
+        assert_eq!(params.game_mode_active(), Some(true));
+        params.video_game_mode = Some(false);
+        assert_eq!(params.game_mode_active(), Some(false));
+        params.picture_mode = None;
+        assert_eq!(params.game_mode_active(), Some(false));
+        params.freesync = Some(true);
+        assert_eq!(params.game_mode_active(), Some(true));
+    }
+
+    #[test]
+    fn unrecognized_picture_mode_does_not_confirm_a_game_mode_exit() {
+        let params = GameParameters { picture_mode: Some(999), ..Default::default() };
+        assert_eq!(params.game_mode_active(), None);
+    }
+
+    #[test]
+    fn crosshair_reload_preserves_game_presets_and_never_rewrites_retained_modes() {
+        for mode in [None, Some(16), Some(14), Some(999)] {
+            assert_eq!(front_sight_reload_mode(true, mode), None);
+        }
+        for mode in [10, 24, 25, 29, 33] {
+            assert_eq!(front_sight_reload_mode(true, Some(mode)), Some(mode));
+            assert_eq!(front_sight_reload_mode(false, Some(mode)), None);
+        }
     }
 
     #[test]

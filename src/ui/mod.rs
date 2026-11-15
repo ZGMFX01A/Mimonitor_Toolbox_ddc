@@ -1,6 +1,7 @@
 pub mod components;
 pub mod pages;
 pub mod theme;
+pub mod navigation;
 pub mod tray_popup;
 pub mod tray_value_popup;
 

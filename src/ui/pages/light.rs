@@ -16,6 +16,7 @@ pub fn render_light_page<V: 'static>(
     on_set_color_temp: impl Fn(&mut V, u32, &mut Context<V>) + 'static + Copy,
     on_set_color_value: impl Fn(&mut V, u32, &mut Context<V>) + 'static + Copy,
 ) -> Div {
+    let section = crate::ui::navigation::section(cx, crate::ui::navigation::LIGHT);
     let is_connected = adb_state.is_connected();
     let is_fully_known = light_state.is_fully_known();
     let is_busy = light_state.is_reading || light_state.is_writing;
@@ -26,7 +27,7 @@ pub fn render_light_page<V: 'static>(
     div()
         .flex()
         .flex_col()
-        .gap_4()
+        .gap_3()
         .w_full()
         // 顶部标题与刷新操作
         .child(
@@ -45,13 +46,13 @@ pub fn render_light_page<V: 'static>(
                                 .text_xl()
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
-                                .child("屏幕灯"),
+                                .child(crate::ui::navigation::section_label(cx, crate::ui::navigation::LIGHT)),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
-                                .child("五种工作模式、亮度挡位(UI 1..15)、照明色温与纯色色彩底层调节"),
+                                .child("选择灯效模式、亮度、照明色温或纯色颜色"),
                         ),
                 )
                 .child(
@@ -137,8 +138,8 @@ pub fn render_light_page<V: 'static>(
                 .child(
                     div()
                         .flex()
-                        .flex_row()
-                        .gap_4()
+                        .flex_row().flex_wrap()
+                        .gap_3()
                         .children([
                             ("当前模式", light_state.mode.map(|m| m.name()).unwrap_or("未知")),
                             (
@@ -169,14 +170,7 @@ pub fn render_light_page<V: 'static>(
                             div()
                                 .id(("param_view", idx))
                                 .flex()
-                                .flex_col()
-                                .flex_1()
-                                .p_2()
-                                .bg(rgb(crate::ui::theme::ThemeColors::BG_CARD()))
-                                .border_1()
-                                .border_color(rgb(ThemeColors::BORDER()))
-                                .rounded_md()
-                                .gap_1()
+                                .items_center().flex_wrap().gap_2()
                                 .child(div().text_xs().text_color(rgb(ThemeColors::TEXT_MUTED())).child(label))
                                 .child(
                                     div()
@@ -189,10 +183,11 @@ pub fn render_light_page<V: 'static>(
                 ),
         )
         // 炫彩灯模式 (5模式：4关、0照明、2纯色、1屏幕同色、3七彩循环)
-        .child(
+// 只挂载当前分组。
+        .when(section == "mode", |d| d.child(
             card_container()
                 .child(
-                    div()
+                    crate::ui::navigation::emphasis(div(), cx, "light-mode")
                         .text_sm()
                         .font_weight(gpui::FontWeight::BOLD)
                         .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
@@ -223,9 +218,10 @@ pub fn render_light_page<V: 'static>(
                                 }))
                         })),
                 ),
-        )
+        ))
         // 亮度挡位 (UI 1..15 = 硬件 0..14)
-        .child(
+// 只挂载当前分组。
+        .when(section == "mode", |d| d.child(
             card_container()
                 .child(
                     div()
@@ -234,11 +230,11 @@ pub fn render_light_page<V: 'static>(
                         .justify_between()
                         .items_center()
                         .child(
-                            div()
+                            crate::ui::navigation::emphasis(div(), cx, "light-brightness")
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
-                                .child("亮度挡位 (UI 1..15 = 底层 0..14)"),
+                                .child("亮度挡位（1–15）"),
                         )
                         .child(
                             div()
@@ -326,9 +322,10 @@ pub fn render_light_page<V: 'static>(
                                 })),
                         ),
                 ),
-        )
+        ))
         // 照明色温 (0=2700K, 1=4000K, 2=6500K)
-        .child(
+// 只挂载当前分组。
+        .when(section == "temperature", |d| d.child(
             card_container()
                 .child(
                     div()
@@ -337,7 +334,7 @@ pub fn render_light_page<V: 'static>(
                         .justify_between()
                         .items_center()
                         .child(
-                            div()
+                            crate::ui::navigation::emphasis(div(), cx, "light-temperature")
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
@@ -373,9 +370,10 @@ pub fn render_light_page<V: 'static>(
                                 }))
                         })),
                 ),
-        )
+        ))
         // 纯色颜色 (0冰蓝 1流金 2天青 3草地 4日落)
-        .child(
+// 只挂载当前分组。
+        .when(section == "color", |d| d.child(
             card_container()
                 .child(
                     div()
@@ -384,7 +382,7 @@ pub fn render_light_page<V: 'static>(
                         .justify_between()
                         .items_center()
                         .child(
-                            div()
+                            crate::ui::navigation::emphasis(div(), cx, "light-color")
                                 .text_sm()
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
@@ -422,5 +420,5 @@ pub fn render_light_page<V: 'static>(
                                 }))
                         })),
                 ),
-        )
+        ))
 }

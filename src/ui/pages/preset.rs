@@ -546,6 +546,7 @@ impl PresetPageView {
 
 impl Render for PresetPageView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let section = crate::ui::navigation::section(cx, crate::ui::navigation::PRESETS);
         let app_state_opt = self.app_state.upgrade();
         let (adb_connected, presets, active_id, has_baseline, baseline_keys_count) =
             if let Some(state_entity) = app_state_opt {
@@ -587,7 +588,7 @@ impl Render for PresetPageView {
                             .text_xl()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
-                            .child("预设模式"),
+                            .child(crate::ui::navigation::section_label(cx, crate::ui::navigation::PRESETS)),
                     )
                     .child(
                         div()
@@ -640,7 +641,7 @@ impl Render for PresetPageView {
                 vec![]
             })
             // 3. 从当前设备采集并新增预设卡片
-            .child(
+            .when(section == "create", |d| d.child(
                 card_container()
                     .child(
                         div()
@@ -688,7 +689,7 @@ impl Render for PresetPageView {
                                     })),
                             ),
                     ),
-            )
+            ))
             // 4. “无预设 / 恢复基线” 卡片
             .child(
                 card_container()
@@ -749,7 +750,7 @@ impl Render for PresetPageView {
                     ),
             )
             // 5. 已保存预设列表
-            .child(
+            .when(section == "list", |d| d.child(
                 div()
                     .flex()
                     .flex_col()
@@ -775,7 +776,7 @@ impl Render for PresetPageView {
                                     div()
                                         .text_xs()
                                         .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
-                                        .child("当前暂无预设。请在上方输入预设名称并点击「从设备抓取并新增」录入第一份预设。"),
+                                        .child("当前暂无预设。切换到「新建预设」，从显示器抓取第一份配置。"),
                                 ),
                         ]
                     } else {
@@ -1003,7 +1004,7 @@ impl Render for PresetPageView {
                                 })
                         }).collect()
                     }),
-            )
+            ))
     }
 }
 

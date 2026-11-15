@@ -150,6 +150,7 @@ pub struct AppState {
     pub display_summary: String,
     pub ddc_refresh_count: u64,
     pub toast: Option<(String, bool)>,
+    toast_revision: u64,
     pub device_busy: bool,
     pub tray_value_results: std::collections::BTreeMap<u64, (u64, Option<String>)>,
     pub text_input: Entity<TextInput>,
@@ -213,6 +214,7 @@ impl AppState {
             ddc_refresh_count: 0,
             device_busy: false,
             tray_value_results: Default::default(),
+            toast_revision: 0,
             toast: if crate::config::migration_blocked() {
                 Some((
                     "旧配置备份失败，已进入只读模式；请检查备份目录权限后重启".into(),
@@ -232,6 +234,28 @@ impl AppState {
             auto_task_page,
             tray_page,
         }
+    }
+
+    fn show_toast(&mut self, message: String, is_error: bool, cx: &mut Context<Self>) {
+        self.toast_revision = self.toast_revision.wrapping_add(1);
+        self.toast = Some((message, is_error));
+        if !is_error {
+            let revision = self.toast_revision;
+            let timer = cx.background_executor().timer(Duration::from_secs(3));
+            cx.spawn(async move |state, cx| {
+                timer.await;
+                let _ = state.update(cx, |state, cx| {
+                    // 新提示（包括相同文案）拥有自己的展示时间；旧计时不能关闭它。
+                    if state.toast_revision == revision
+                        && state.toast.as_ref().is_some_and(|(_, error)| !error)
+                    {
+                        state.toast = None;
+                        cx.notify();
+                    }
+                });
+            }).detach();
+        }
+        cx.notify();
     }
 
     fn connect_ip(&mut self, input: &str, cx: &mut Context<Self>) {
@@ -284,6 +308,13 @@ impl AppState {
 pub struct MainWindow {
     app_state: Entity<AppState>,
     _subscription: Subscription,
+    search_input: Entity<TextInput>,
+    search_query: String,
+    search_selected: usize,
+    content_scroll: gpui::ScrollHandle,
+    focus_handle: gpui::FocusHandle,
+    result_anchors: Vec<gpui::ScrollAnchor>,
+    last_location: (String, String),
 }
 
 impl MainWindow {
@@ -291,10 +322,90 @@ impl MainWindow {
         let _subscription = cx.observe(&app_state, |_this, _state, cx| {
             cx.notify();
         });
+        let owner = cx.entity().downgrade();
+        let search_input = cx.new(|cx| {
+            let mut input = TextInput::new(cx, "搜索配置项…", "");
+            input.set_on_change(move |query, _, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    this.search_query = query.to_string();
+                    this.search_selected = 0;
+                    this.content_scroll.set_offset(Point::default());
+                    cx.notify();
+                });
+            });
+            input
+        });
+        let content_scroll = gpui::ScrollHandle::new();
+        let result_anchors = crate::ui::navigation::SETTINGS.iter()
+            .map(|_| gpui::ScrollAnchor::for_handle(content_scroll.clone())).collect();
         Self {
             app_state,
             _subscription,
+            search_input,
+            search_query: String::new(),
+            search_selected: 0,
+            content_scroll,
+            focus_handle: cx.focus_handle(),
+            result_anchors,
+            last_location: (String::new(), String::new()),
         }
+    }
+
+    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.search_query.clear();
+        self.search_selected = 0;
+        self.search_input.update(cx, |input, cx| input.set_text("", cx));
+        self.content_scroll.set_offset(Point::default());
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn navigate(&mut self, page: &'static str, section: &'static str,
+        target: Option<&'static crate::ui::navigation::Setting>, window: &mut Window, cx: &mut Context<Self>) {
+        crate::ui::navigation::select(cx, page, section, target);
+        self.app_state.update(cx, |state, cx| {
+            state.active_tab = page.into();
+            cx.notify();
+        });
+        if target.is_some_and(|s| s.id == "shell" || s.id == "apk") {
+            let tools = self.app_state.read(cx).tools_page.clone();
+            tools.update(cx, |tools, cx| tools.expand_terminal(cx));
+        }
+        self.clear_search(window, cx);
+        if target.is_some() {
+            let anchor = gpui::ScrollAnchor::for_handle(self.content_scroll.clone());
+            cx.default_global::<crate::ui::navigation::SettingsNavigation>().target_anchor = Some(anchor.clone());
+            crate::ui::navigation::reveal(&anchor, window, cx);
+        }
+    }
+
+    fn render_search_results(&self, cx: &mut Context<Self>) -> gpui::Div {
+        use crate::ui::navigation as nav;
+        let results = nav::search(&self.search_query);
+        div().flex().flex_col().gap_3().w_full()
+            .child(div().text_xl().font_weight(gpui::FontWeight::BOLD).child("搜索配置"))
+            .child(div().text_sm().text_color(rgb(ThemeColors::TEXT_SECONDARY()))
+                .child(format!("找到 {} 项配置 · 点击前往设置，↑ ↓ 选择，Enter 打开", results.len())))
+            .when(results.is_empty(), |d| d.child(crate::ui::components::card_container()
+                .child("没有找到相关配置")
+                .child(div().text_sm().text_color(rgb(ThemeColors::TEXT_SECONDARY()))
+                    .child("试试更短的关键词，例如「控光」「色温」「准星」「开机」，或英文 local dimming。"))))
+            .children(results.into_iter().enumerate().map(|(index, setting)| {
+                let p = nav::page(setting.page);
+                let section = p.sections.iter().find(|s| s.0 == setting.section).map(|s| s.1).unwrap_or(p.label);
+                div().id(("setting-result", index)).cursor_pointer().p_3().rounded_lg()
+                    .anchor_scroll(Some(self.result_anchors[index].clone()))
+                    .bg(rgb(ThemeColors::BG_CARD())).border_1()
+                    .border_color(rgb(if index == self.search_selected { ThemeColors::ACCENT_CYAN() } else { ThemeColors::BORDER() }))
+                    .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())))
+                    .flex().items_center().justify_between().gap_3()
+                    .child(div().flex().flex_col().gap_1().flex_1().min_w_0()
+                        .child(div().text_sm().font_weight(gpui::FontWeight::SEMIBOLD).child(setting.label))
+                        .child(div().text_xs().text_color(rgb(ThemeColors::TEXT_SECONDARY()))
+                            .child(format!("{} / {} / {}", p.group, p.label, section))))
+                    .child(div().text_xs().text_color(rgb(ThemeColors::ACCENT_CYAN())).child("前往  ›"))
+                    .on_click(cx.listener(move |this, _, window, cx| this.navigate(setting.page, setting.section, Some(setting), window, cx)))
+            }))
     }
 
     fn on_connect(&mut self, cx: &mut Context<Self>) {
@@ -510,6 +621,7 @@ impl MainWindow {
 
 impl Render for MainWindow {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if _window.focused(cx).is_none() { self.focus_handle.focus(_window); }
         let (
             active_tab,
             adb_state,
@@ -562,20 +674,37 @@ impl Render for MainWindow {
         };
         let app_state_entity = self.app_state.clone();
 
-        let nav_items: [(&str, &str, Option<&str>); 10] = [
-            ("主页 & 连接", "主页连接", Some("设备控制")),
-            ("画面设置", "画面设置", None),
-            ("游戏模式", "游戏模式", None),
-            ("信号源切换", "信号源", None),
-            ("屏幕灯", "屏幕灯", None),
-            ("托盘菜单", "托盘菜单", Some("自动化与设置")),
-            ("预设模式", "预设模式", None),
-            ("自动任务", "自动任务", None),
-            ("工具与设置", "工具设置", None),
-            ("遥控器", "遥控器", None),
-        ];
+        use crate::ui::navigation as nav;
+        let active_page = nav::page(&active_tab);
+        let active_section = nav::section(cx, &active_tab);
+        if self.last_location.0 != active_tab || self.last_location.1 != active_section {
+            self.content_scroll.set_offset(Point::default());
+            self.last_location = (active_tab.clone(), active_section.to_string());
+        }
+        let searching = !self.search_query.trim().is_empty();
 
         div()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if this.search_input.read(cx).is_composing() { return; }
+                if event.keystroke.key == "escape" && (!this.search_query.is_empty()
+                    || this.search_input.read(cx).focus_handle.is_focused(window)) {
+                    this.clear_search(window, cx);
+                    cx.stop_propagation();
+                } else if event.keystroke.modifiers.control && event.keystroke.key == "k" {
+                    this.search_input.read(cx).focus_handle.focus(window);
+                    cx.stop_propagation();
+                } else if !this.search_query.trim().is_empty() {
+                    let results = crate::ui::navigation::search(&this.search_query);
+                    if results.is_empty() { return; }
+                    match event.keystroke.key.as_str() {
+                        "down" => { this.search_selected = (this.search_selected + 1).min(results.len().saturating_sub(1)); crate::ui::navigation::reveal(&this.result_anchors[this.search_selected], window, cx); cx.notify(); cx.stop_propagation(); }
+                        "up" => { this.search_selected = this.search_selected.saturating_sub(1); crate::ui::navigation::reveal(&this.result_anchors[this.search_selected], window, cx); cx.notify(); cx.stop_propagation(); }
+                        "enter" => { if let Some(setting) = results.get(this.search_selected) { this.navigate(setting.page, setting.section, Some(setting), window, cx); } }
+                        _ => {}
+                    }
+                }
+            }))
             .flex()
             .flex_col()
             .size_full()
@@ -793,101 +922,75 @@ impl Render for MainWindow {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    // 左侧导航侧边栏 (宽160px，自适应纵向滚动)
+                    // 搜索和底部信息固定，中间菜单独立滚动。
                     .child(
-                        div()
-                            .id("sidebar-scroll")
-                            .overflow_y_scroll()
-                            .min_h_0()
-                            .w(px(160.0))
-                            .flex_shrink_0()
-                            .flex()
-                            .flex_col()
-                            .justify_between()
-                            .p_2()
-                            .bg(rgb(crate::ui::theme::ThemeColors::BG_CARD()))
-                            .border_r_1()
-                            .border_color(rgb(ThemeColors::BORDER()))
-                            .child(div().flex().flex_col().gap_0p5().children(
-                                nav_items.into_iter().enumerate().map(|(idx, (tab_key, tab_label, group_header))| {
-                                    let is_active = tab_key == active_tab;
-                                    let name_str = tab_key.to_string();
-                                    let app_state_for_click = app_state_entity.clone();
-
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .children(group_header.map(|header| {
-                                            div()
-                                                .pt_2()
-                                                .pb_1()
-                                                .px_2()
-                                                .text_size(px(11.0))
-                                                .font_weight(gpui::FontWeight::BOLD)
-                                                .text_color(rgb(ThemeColors::TEXT_MUTED()))
-                                                .child(header)
-                                        }))
-                                        .child(
-                                            div()
-                                                .id(("nav_item", idx))
-                                                .px_3()
-                                                .py_1p5()
-                                                .rounded_md()
-                                                .text_xs()
-                                                .font_weight(if is_active {
-                                                    gpui::FontWeight::BOLD
-                                                } else {
-                                                    gpui::FontWeight::NORMAL
-                                                })
-                                                .bg(if is_active {
-                                                    rgb(ThemeColors::ACCENT_BG_SUBTLE())
-                                                } else {
-                                                    rgb(crate::ui::theme::ThemeColors::BG_CARD())
-                                                })
-                                                .border_1()
-                                                .border_color(if is_active {
-                                                    rgb(ThemeColors::ACCENT_CYAN())
-                                                } else {
-                                                    rgb(crate::ui::theme::ThemeColors::BG_CARD())
-                                                })
-                                                .text_color(if is_active {
-                                                    rgb(ThemeColors::ACCENT_CYAN())
-                                                } else {
-                                                    rgb(ThemeColors::TEXT_SECONDARY())
-                                                })
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())).text_color(rgb(ThemeColors::TEXT_PRIMARY())))
-                                                .child(tab_label)
-                                                .on_click(cx.listener(move |_this, _, _, cx| {
-                                                    app_state_for_click.update(cx, |st, cx| {
-                                                        st.active_tab = name_str.clone();
-                                                        cx.notify();
-                                                    });
-                                                })),
-                                        )
-                                }),
-                            ))
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_2()
-                                    .border_t_1()
-                                    .border_color(rgb(ThemeColors::BORDER()))
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(ThemeColors::TEXT_MUTED()))
-                                    .child("本地控制 · 独立通道"),
-                            ),
+                        div().w(px(196.0)).flex_shrink_0().flex().flex_col().min_h_0()
+                            .bg(rgb(ThemeColors::BG_CARD())).border_r_1().border_color(rgb(ThemeColors::BORDER()))
+                            .child(div().px_3().py_2().flex_shrink_0().flex().flex_col().gap_1()
+                                .child(div().flex().items_center().gap_1()
+                                    .child(div().flex_1().min_w_0().child(self.search_input.clone()))
+                                    .child(div().id("clear-settings-search").cursor_pointer().w(px(24.0)).h(px(32.0))
+                                        .flex().items_center().justify_center().rounded_md()
+                                        .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
+                                        .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())))
+                                        .child("×").on_click(cx.listener(|this, _, window, cx| this.clear_search(window, cx)))))
+                                .child(div().text_size(px(10.0)).text_color(rgb(ThemeColors::TEXT_MUTED())).child("查找所有配置  ·  Ctrl+K")))
+                            .child(div().id("sidebar-scroll").flex_1().min_h_0().overflow_y_scroll().px_2().pb_2()
+                                .children(["显示器控制", "场景与自动化", "应用"].into_iter().enumerate().map(|(group_index, group)| {
+                                    div().flex().flex_col().flex_shrink_0().when(group_index > 0, |d| d.mt_2())
+                                        .child(div().h(px(26.0)).flex_shrink_0().px_2().flex().items_center()
+                                            .bg(rgb(ThemeColors::BG_HOVER())).border_t_1().border_b_1()
+                                            .border_color(rgb(ThemeColors::BORDER()))
+                                            .text_size(px(14.0)).line_height(px(18.0)).font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(rgb(ThemeColors::TEXT_PRIMARY())).child(group))
+                                        .child(div().flex().flex_col().ml_2().pl_2().pt_1()
+                                            .border_l_1().border_color(rgb(ThemeColors::BORDER()))
+                                            .children(nav::PAGES.iter().filter(move |p| p.group == group).map(|p| {
+                                            let selected = p.id == active_tab && !searching;
+                                            div().id(gpui::SharedString::from(format!("nav-{}", p.id))).h(px(30.0)).flex_shrink_0()
+                                                .flex().items_center().gap_2().rounded_md().cursor_pointer()
+                                                .bg(rgb(if selected { ThemeColors::ACCENT_BG_SUBTLE() } else { ThemeColors::BG_CARD() }))
+                                                .hover(|s| s.bg(rgb(ThemeColors::BG_HOVER())))
+                                                .child(div().w(px(3.0)).h(px(20.0)).rounded_full()
+                                                    .bg(rgb(if selected { ThemeColors::ACCENT_CYAN() } else { ThemeColors::BG_CARD() })))
+                                                .child(div().text_size(px(13.0)).text_color(rgb(ThemeColors::TEXT_PRIMARY()))
+                                                    .font_weight(if selected { gpui::FontWeight::SEMIBOLD } else { gpui::FontWeight::NORMAL }).child(p.label))
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    let section = crate::ui::navigation::section(cx, p.id);
+                                                    this.navigate(p.id, section, None, window, cx);
+                                                }))
+                                        })))
+                                })))
+                            .child(div().flex_shrink_0().mx_3().py_2().border_t_1().border_color(rgb(ThemeColors::BORDER()))
+                                .text_size(px(10.0)).text_color(rgb(ThemeColors::TEXT_MUTED())).child("本地控制 · 独立通道")),
                     )
                     // 右侧内容区 (可滚动、响应式)
                     .child(
+                        div().flex_1().min_w_0().min_h_0().flex().flex_col()
+                            .child(div().flex_shrink_0().px_4().py_3().border_b_1().border_color(rgb(ThemeColors::BORDER()))
+                                .flex().flex_col().gap_2()
+                                .child(div().text_xs().text_color(rgb(ThemeColors::TEXT_SECONDARY()))
+                                    .child(if searching { "所有配置 / 搜索".to_string() } else { format!("{} / {}", active_page.group, active_page.label) }))
+                                .when(!searching && !active_page.sections.is_empty(), |d| d.child(div().flex().flex_wrap().gap_2()
+                                    .children(active_page.sections.iter().map(|&(id, label)| {
+                                        crate::ui::components::option_button(label, id == active_section, false)
+                                            .id(gpui::SharedString::from(format!("section-{id}")))
+                                            .on_click(cx.listener(move |this, _, window, cx| this.navigate(active_page.id, id, None, window, cx)))
+                                    }))))
+                                .when(!searching && cx.try_global::<nav::SettingsNavigation>().is_some_and(|n| n.target.is_some()), |d| d.child(nav::location_hint(cx))))
+                            .child(
                         div()
                             .id("main_content_scroll_area")
+                            .track_scroll(&self.content_scroll)
                             .relative()
                             .flex_1()
                             .min_h_0()
                             .min_w_0()
                             .overflow_y_scroll()
-                            .p_5()
+                            .p_4()
+                            .child(div().w_full().max_w(px(1100.0)).mx_auto()
+                            .when(searching, |d| d.child(self.render_search_results(cx)))
+                            .when(!searching, |d| d
                             .children(active_preset_name.as_ref().map(|name| {
                                 div()
                                     .mb_4()
@@ -998,6 +1101,7 @@ impl Render for MainWindow {
                                 "遥控器" => render_remote_page(remote_page),
                                 _ => div().child("未知页面"),
                             })
+                            ))
                             .when(self.app_state.read(cx).device_busy, |area| {
                                 area.child(
                                     div()
@@ -1018,7 +1122,8 @@ impl Render for MainWindow {
                                         })
                                         .on_click(|_, _, cx| cx.stop_propagation()),
                                 )
-                            }),
+                            })
+                            ),
                     ),
             )
             // 底部状态栏
@@ -1709,6 +1814,7 @@ fn run_ui_application(
                 .open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        window_min_size: Some(size(px(800.0), px(600.0))),
                         titlebar: Some(gpui::TitlebarOptions {
                             title: Some("Mimonitor 工具箱".into()),
                             appears_transparent: true,
@@ -2116,6 +2222,11 @@ fn run_ui_application(
                         }
                         let _ = async_cx.update(|cx| {
                             app_state_pump.update(cx, |st, cx| match evt {
+                                AppEvent::DesktopModeResult { result, generation } => {
+                                    if generation == bus_pump.active_generation.load(Ordering::Acquire) {
+                                        st.tools_page.update(cx, |page, cx| page.on_desktop_result(result, cx));
+                                    }
+                                }
                                 AppEvent::TrayValueResult { request_id, generation, error } => {
                                     if generation == bus_pump.active_generation.load(Ordering::Acquire) {
                                         st.tray_value_results.retain(|_, (epoch, _)| *epoch == generation);
@@ -2145,7 +2256,7 @@ fn run_ui_application(
                                     {
                                         st.device_busy = active;
                                         if !message.is_empty() {
-                                            st.toast = Some((message, is_error));
+                                            st.show_toast(message, is_error, cx);
                                         }
                                     }
                                     cx.notify();
@@ -2418,18 +2529,18 @@ fn run_ui_application(
                                             if let Some(ip) = single_scan_target(&st.discovered_devices) {
                                                 st.connect_ip(&ip, cx);
                                             } else {
-                                                st.toast = Some((if found_count == 0 {
+                                                st.show_toast(if found_count == 0 {
                                                     "未发现显示器，请检查显示器与电脑是否连接同一网络".into()
                                                 } else {
                                                     format!("发现 {found_count} 台设备，点击要连接的显示器")
-                                                }, found_count == 0));
+                                                }, found_count == 0, cx);
                                             }
                                         }
                                         cx.notify();
                                     }
                                 }
                                 AppEvent::ToastNotification { message, is_error } => {
-                                    st.toast = Some((message, is_error));
+                                    st.show_toast(message, is_error, cx);
                                     cx.notify();
                                 }
                                 AppEvent::HotkeyOsd { .. } => {}
@@ -2470,7 +2581,7 @@ fn run_ui_application(
                                         st.picture_page.update(cx, |page, cx| {
                                             page.advanced.update(cx, |view, cx| view.completed(cx))
                                         });
-                                        st.toast = Some((report, is_error));
+                                        st.show_toast(report, is_error, cx);
                                         cx.notify();
                                     }
                                 }

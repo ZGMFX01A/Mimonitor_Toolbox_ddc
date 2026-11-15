@@ -40,6 +40,7 @@ impl SourcePage {
     }
 
     pub fn set_connected(&mut self, connected: bool, generation: u64, cx: &mut Context<Self>) {
+        let was_connected = self.is_connected;
         let gen_changed = self.generation != generation;
         self.is_connected = connected;
         self.generation = generation;
@@ -51,6 +52,10 @@ impl SourcePage {
             self.target_source = None;
             self.status_message = None;
             self.error_message = None;
+        }
+        // 新窗口会重放连接状态；后台此前的读取可能已在窗口创建前完成。
+        if connected && (!was_connected || gen_changed) {
+            self.request_refresh(cx);
         }
         cx.notify();
     }
@@ -111,6 +116,8 @@ impl SourcePage {
             return;
         }
         self.is_reading = false;
+        self.current_source = None;
+        self.raw_source.clear();
         self.error_message = Some(error.to_string());
         cx.notify();
     }

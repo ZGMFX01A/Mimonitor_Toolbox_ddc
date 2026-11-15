@@ -9,6 +9,8 @@ use crate::presets::ApplyResult;
 /// 界面向后台工作管道提交的强类型业务指令（均携带会话或代数标识）
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AppCommand {
+    FetchDesktopMode { generation: u64 },
+    SetDesktopMode { mode: crate::device::desktop::DesktopMode, generation: u64 },
     EditPresetConfig { mutation: preset_sync::PresetConfigMutation, request_id: u64 },
     TrayValueCommit {
         param: crate::hotkey::AdjustParam,
@@ -173,6 +175,10 @@ pub enum AppCommand {
 /// 后台向界面通知的异步业务事件
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum AppEvent {
+    DesktopModeResult {
+        result: Result<crate::device::desktop::DesktopModeState, String>,
+        generation: u64,
+    },
     PresetConfigResult {
         request_id: u64,
         mutation: preset_sync::PresetConfigMutation,

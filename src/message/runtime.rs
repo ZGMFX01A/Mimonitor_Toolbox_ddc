@@ -57,6 +57,26 @@ fn is_game(command: &AppCommand) -> bool {
             | SwitchGameModeAndApply { .. }
     )
 }
+
+fn operation_message(command: &AppCommand, result: &Result<(), String>) -> String {
+    match result {
+        Ok(()) if matches!(command,
+            AppCommand::FetchPictureParameters { .. }
+                | AppCommand::FetchBacklight { .. }
+                | AppCommand::FetchGameParameters { .. }
+                | AppCommand::FetchScreenLight { .. }
+                | AppCommand::RefreshSource { .. }
+                | AppCommand::FetchDesktopMode { .. }
+                | AppCommand::ToolAction {
+                    action: super::actions::ToolAction::ReadStatus
+                        | super::actions::ToolAction::CheckGuardian,
+                    ..
+                }
+        ) => String::new(),
+        Ok(()) => "设备操作已完成".into(),
+        Err(error) => format!("设备操作失败：{error}"),
+    }
+}
 #[derive(Clone)]
 struct Envelope {
     command: AppCommand,
@@ -166,6 +186,7 @@ fn coalesce_key(command: &AppCommand) -> Option<String> {
         RefreshMonitors => "monitors".into(),
         FetchPictureParameters { generation } => format!("read-picture:{generation}"),
         FetchGameParameters { generation } => format!("read-game:{generation}"),
+        FetchDesktopMode { generation } => format!("read-desktop:{generation}"),
         SetPictureMode { generation, .. } => format!("mode:{generation}"),
         SetLightSensor { generation, .. } => format!("sensor:{generation}"),
         SetLocalDimming { generation, .. } => format!("dimming:{generation}"),
@@ -186,6 +207,8 @@ fn generation(command: &AppCommand) -> Option<u64> {
         | ConnectAdb { generation, .. }
         | CancelConnection { generation }
         | FetchBacklight { generation }
+        | FetchDesktopMode { generation }
+        | SetDesktopMode { generation, .. }
         | SetPictureMode { generation, .. }
         | FetchPictureParameters { generation }
         | SetPictureSlider { generation, .. }
@@ -843,22 +866,7 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
                 let _ = bus.event_sender.send(AppEvent::DeviceActivity {
                     generation: live,
                     active: false,
-                    message: match &result {
-                        Ok(_)
-                            if matches!(
-                                env.command,
-                                AppCommand::FetchPictureParameters { .. }
-                                    | AppCommand::FetchBacklight { .. }
-                                    | AppCommand::FetchGameParameters { .. }
-                                    | AppCommand::FetchScreenLight { .. }
-                                    | AppCommand::RefreshSource { .. }
-                            ) =>
-                        {
-                            String::new()
-                        }
-                        Ok(_) => "设备操作已完成".into(),
-                        Err(e) => format!("设备操作失败：{e}"),
-                    },
+                    message: operation_message(&env.command, &result),
                     is_error: result.is_err(),
                 });
                 if let Err(error) = result {
@@ -867,6 +875,11 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
                         generation: live,
                     });
                     match env.command {
+                        AppCommand::FetchDesktopMode { .. } | AppCommand::SetDesktopMode { .. } => {
+                            let _ = bus.event_sender.send(AppEvent::DesktopModeResult {
+                                result: Err(error), generation: live,
+                            });
+                        }
                         AppCommand::FetchPictureParameters { .. } => {
                             let _ = bus.event_sender.send(AppEvent::PictureFetchFailed {
                                 message: error,
@@ -939,6 +952,14 @@ fn execute(
     let tx = &bus.event_sender;
     let fail = |e: crate::adb::AdbError| e.to_string();
     match command {
+        FetchDesktopMode { .. } | SetDesktopMode { .. } => {
+            let result = match command {
+                SetDesktopMode { mode, .. } => crate::device::desktop::set_desktop_mode(dev, *mode),
+                _ => crate::device::desktop::query_desktop_mode(dev),
+            }.map_err(fail);
+            let state = result?;
+            let _ = tx.send(AppEvent::DesktopModeResult { result: Ok(state), generation: gen });
+        }
         TrayValueCommit { param, value, generation, .. } => {
             return execute(dev, &HotkeyCommit { param: *param, value: *value, generation: *generation }, bus, read_revision);
         }
@@ -1376,6 +1397,25 @@ fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_reads_do_not_report_a_device_write_success() {
+        let commands = [
+            AppCommand::RefreshSource { generation: 1 },
+            AppCommand::FetchBacklight { generation: 1 },
+            AppCommand::FetchPictureParameters { generation: 1 },
+            AppCommand::FetchGameParameters { generation: 1 },
+            AppCommand::FetchScreenLight { generation: 1, revision: 0 },
+            AppCommand::ToolAction { action: super::super::actions::ToolAction::CheckGuardian, generation: 1 },
+            AppCommand::ToolAction { action: super::super::actions::ToolAction::ReadStatus, generation: 1 },
+        ];
+        for command in commands {
+            assert!(operation_message(&command, &Ok(())).is_empty(), "{command:?}");
+            assert!(operation_message(&command, &Err("回读失败".into())).contains("回读失败"));
+        }
+        assert_eq!(operation_message(
+            &AppCommand::SetBacklight { value: 20, generation: 1 }, &Ok(())
+        ), "设备操作已完成");
+    }
     #[test]
     fn connection_recovery_is_bounded_and_stops_for_authorization_or_cancel() {
         use crate::adb::AdbError::*;

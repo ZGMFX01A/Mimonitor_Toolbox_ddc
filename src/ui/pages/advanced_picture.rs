@@ -18,6 +18,7 @@ pub struct AdvancedPicture {
     reset_confirm: bool,
 }
 impl AdvancedPicture {
+    pub fn is_busy(&self) -> bool { self.busy }
     pub fn new(bus: Arc<MessageBus>, cx: &mut Context<Self>) -> Self {
         let weak = cx.entity().downgrade();
         let gains = ["红色增益", "绿色增益", "蓝色增益"]
@@ -143,7 +144,12 @@ impl AdvancedPicture {
 }
 impl Render for AdvancedPicture {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut root = card_container().child(div().text_lg().child("高级画面设置"));
+        let color = crate::ui::navigation::section(cx, crate::ui::navigation::PICTURE) == "color";
+        let mut root = card_container().child(div().text_sm().font_weight(gpui::FontWeight::SEMIBOLD)
+            .child(if color { "色温与色域" } else { "动态画面与响应" }));
+        if self.busy {
+            root = root.child(div().text_sm().text_color(rgb(ThemeColors::STATUS_WARNING())).child("画面调整进行中…"));
+        }
         let groups: [(&str, &str, Option<i32>, &[(i32, &str)]); 5] = [
             (
                 "色温",
@@ -190,6 +196,7 @@ impl Render for AdvancedPicture {
             ),
         ];
         for (label, key, current, options) in groups {
+            if color != matches!(key, "color_temp" | "color_space") { continue; }
             let disabled = !self.connected
                 || self.busy
                 || current.is_none()
@@ -203,7 +210,7 @@ impl Render for AdvancedPicture {
                 .flex_wrap()
                 .items_center()
                 .gap_2()
-                .child(div().w(gpui::px(110.0)).text_sm().child(label));
+                .child(div().w(gpui::px(90.0)).text_sm().child(label));
             for &(value, name) in options {
                 let key = key.to_string();
                 row = row.child(
@@ -225,16 +232,17 @@ impl Render for AdvancedPicture {
             if current.is_none() {
                 row = row.child(div().text_xs().child("未读取"));
             }
-            root = root.child(row);
+            root = root.child(crate::ui::navigation::emphasis(row, cx, key));
         }
-        root = root.children(self.gains.iter().cloned()).child(
+        root = root.when(color, |root| root.children(self.gains.iter().cloned()).child(
             div()
                 .text_xs()
                 .child("自定义色温下调整 RGB，范围 524–1524；每次保留另外两个通道。"),
-        );
+        ));
         let confirm = self.reset_confirm;
         let disabled = !self.connected || self.busy;
-        root.child(
+        root.when(!color, |root| root.child(
+            crate::ui::navigation::emphasis(div(), cx, "reset-picture").child(
             option_button(
                 if confirm {
                     "确认恢复当前模式默认值"
@@ -257,6 +265,7 @@ impl Render for AdvancedPicture {
                     cx.notify();
                 }
             })),
+            ),
         )
         .when(confirm, |d| {
             d.child(
@@ -265,6 +274,6 @@ impl Render for AdvancedPicture {
                     .text_color(rgb(ThemeColors::STATUS_WARNING()))
                     .child("此操作将重置当前画面模式的参数，再次点击确认。"),
             )
-        })
+        }))
     }
 }

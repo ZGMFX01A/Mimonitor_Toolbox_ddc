@@ -184,7 +184,7 @@ impl Render for RemotePage {
                     .child(
                         div()
                             .w(px(320.0))
-                            .p_6()
+                            .p_4()
                             .rounded_xl()
                             .border_1()
                             .border_color(rgb(ThemeColors::BORDER()))
@@ -192,7 +192,7 @@ impl Render for RemotePage {
                             .flex()
                             .flex_col()
                             .items_center()
-                            .gap_5()
+                            .gap_3()
                             // 遥控器顶部品牌标
                             .child(
                                 div()

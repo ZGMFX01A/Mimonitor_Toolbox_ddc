@@ -39,6 +39,7 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    horizontal_offset: Pixels,
     is_selecting: bool,
     on_change: Option<Box<dyn Fn(&str, &mut Window, &mut Context<Self>) + 'static>>,
 }
@@ -60,6 +61,7 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            horizontal_offset: px(0.0),
             is_selecting: false,
             on_change: None,
         }
@@ -78,12 +80,17 @@ impl TextInput {
         &self.content
     }
 
+    pub fn is_composing(&self) -> bool {
+        self.marked_range.is_some()
+    }
+
     /// 外部设置输入文本
     pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.content = text.into();
         let len = self.content.len();
         self.selected_range = len..len;
         self.marked_range = None;
+        self.horizontal_offset = px(0.0);
         cx.notify();
     }
 
@@ -220,7 +227,7 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + self.horizontal_offset)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -394,11 +401,11 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start),
+                bounds.left() + last_layout.x_for_index(range.start) - self.horizontal_offset,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end),
+                bounds.left() + last_layout.x_for_index(range.end) - self.horizontal_offset,
                 bounds.bottom(),
             ),
         ))
@@ -410,9 +417,10 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let line_point = self.last_bounds?.localize(&point)?;
+        let bounds = self.last_bounds?;
+        bounds.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        let utf8_index = last_layout.index_for_x(point.x - bounds.left() + self.horizontal_offset)?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -425,6 +433,7 @@ struct PrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    horizontal_offset: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -473,6 +482,7 @@ impl Element for TextElement {
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
+        let previous_offset = input.horizontal_offset;
         let style = window.text_style();
 
         let (display_text, text_color): (SharedString, gpui::Hsla) = if content.is_empty() {
@@ -524,7 +534,16 @@ impl Element for TextElement {
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
 
-        let cursor_pos = line.x_for_index(cursor);
+        let cursor_x = line.x_for_index(cursor);
+        let available_width = (bounds.size.width - px(2.0)).max(px(0.0));
+        let horizontal_offset = if cursor_x < previous_offset {
+            cursor_x
+        } else if cursor_x > previous_offset + available_width {
+            cursor_x - available_width
+        } else {
+            previous_offset.min((line.width - available_width).max(px(0.0)))
+        };
+        let cursor_pos = cursor_x - horizontal_offset;
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
@@ -541,11 +560,11 @@ impl Element for TextElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + line.x_for_index(selected_range.start),
+                            bounds.left() + line.x_for_index(selected_range.start) - horizontal_offset,
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + line.x_for_index(selected_range.end),
+                            bounds.left() + line.x_for_index(selected_range.end) - horizontal_offset,
                             bounds.bottom(),
                         ),
                     ),
@@ -558,6 +577,7 @@ impl Element for TextElement {
             line: Some(line),
             cursor,
             selection,
+            horizontal_offset,
         }
     }
 
@@ -577,22 +597,22 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection);
-        }
         let line = prepaint.line.take().unwrap();
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .unwrap();
-
-        if focus_handle.is_focused(window) {
-            if let Some(cursor) = prepaint.cursor.take() {
-                window.paint_quad(cursor);
+        let horizontal_offset = prepaint.horizontal_offset;
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            if let Some(selection) = prepaint.selection.take() {
+                window.paint_quad(selection);
             }
-        }
+            line.paint(point(bounds.left() - horizontal_offset, bounds.top()), window.line_height(), window, cx).unwrap();
+            if focus_handle.is_focused(window) {
+                if let Some(cursor) = prepaint.cursor.take() { window.paint_quad(cursor); }
+            }
+        });
 
         self.input.update(cx, |input, _cx| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.horizontal_offset = horizontal_offset;
         });
     }
 }

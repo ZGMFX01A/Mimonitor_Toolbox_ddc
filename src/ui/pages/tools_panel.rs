@@ -1,4 +1,5 @@
 use crate::{
+    device::desktop::{DesktopMode, DesktopModeState},
     config::{AppConfig, CloseBehavior},
     message::{actions::ToolAction, AppCommand, AppEvent, MessageBus},
     ui::components::{badge, card_container, option_button, TextInput},
@@ -9,6 +10,9 @@ use gpui::{div, Context, Div, Entity, FontWeight, Render, SharedString, Window};
 use std::{collections::HashMap, sync::Arc};
 
 pub struct ToolsPage {
+    desktop_state: Option<DesktopModeState>,
+    desktop_error: Option<String>,
+    desktop_busy: bool,
     guardian: Option<crate::device::guardian::GuardianStatus>,
     displays: Vec<crate::ddc::RawDisplayItem>,
     bus: Arc<MessageBus>,
@@ -42,6 +46,10 @@ pub fn save_patch(bus: Arc<MessageBus>, patch: HashMap<String, serde_json::Value
     });
 }
 impl ToolsPage {
+    pub fn expand_terminal(&mut self, cx: &mut Context<Self>) {
+        self.terminal_expanded = true;
+        cx.notify();
+    }
     pub fn new(bus: Arc<MessageBus>, config: AppConfig, cx: &mut Context<Self>) -> Self {
         let shell_input = cx.new(|cx| TextInput::new(cx, "例如 getprop ro.product.model", ""));
         let apk_input = cx.new(|cx| TextInput::new(cx, "选择或填写 APK 文件路径", ""));
@@ -65,6 +73,9 @@ impl ToolsPage {
             )
         });
         Self {
+            desktop_state: None,
+            desktop_error: None,
+            desktop_busy: false,
             guardian: None,
             displays: Vec::new(),
             bus,
@@ -84,7 +95,11 @@ impl ToolsPage {
         }
     }
     pub fn set_connected(&mut self, connected: bool, generation: u64, ip: Option<&str>, cx: &mut Context<Self>) {
-        if generation != self.generation || connected != self.connected {
+        let changed = generation != self.generation || connected != self.connected;
+        if changed {
+            self.desktop_state = None;
+            self.desktop_error = None;
+            self.desktop_busy = false;
             self.report = if connected {
                 "点击刷新读取设备状态"
             } else {
@@ -98,8 +113,33 @@ impl ToolsPage {
         self.connected_serial = ip.filter(|_| connected).map(|ip| crate::adb::format_adb_serial(ip, 5555));
         self.connected = connected;
         self.generation = generation;
+        if connected && changed {
+            self.request_desktop_mode(None, cx);
+        }
         if connected && self.guardian.is_none() && !self.busy {
             self.request(ToolAction::CheckGuardian, cx);
+        }
+        cx.notify();
+    }
+    fn request_desktop_mode(&mut self, target: Option<DesktopMode>, cx: &mut Context<Self>) {
+        if !self.connected || self.desktop_busy { return; }
+        let command = match target {
+            Some(mode) => AppCommand::SetDesktopMode { mode, generation: self.generation },
+            None => AppCommand::FetchDesktopMode { generation: self.generation },
+        };
+        self.desktop_busy = true;
+        self.desktop_error = None;
+        if self.bus.cmd_sender.send(command).is_err() {
+            self.desktop_busy = false;
+            self.desktop_error = Some("桌面模式操作提交失败，请稍后重试".into());
+        }
+        cx.notify();
+    }
+    pub fn on_desktop_result(&mut self, result: Result<DesktopModeState, String>, cx: &mut Context<Self>) {
+        self.desktop_busy = false;
+        match result {
+            Ok(state) => { self.desktop_state = Some(state); self.desktop_error = None; }
+            Err(error) => { self.desktop_state = None; self.desktop_error = Some(error); }
         }
         cx.notify();
     }
@@ -155,7 +195,42 @@ impl ToolsPage {
 }
 impl Render for ToolsPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let section = crate::ui::navigation::section(cx, crate::ui::navigation::TOOLS);
         let disabled = !self.connected || self.busy;
+        let desktop_disabled = disabled || self.desktop_busy;
+        let desktop_current = self.desktop_state.as_ref().and_then(|state| state.mode);
+        let desktop_label = if self.desktop_busy {
+            "正在读取或切换桌面模式…".to_string()
+        } else if let Some(mode) = desktop_current {
+            format!("当前桌面：{}", mode.name())
+        } else if let Some(state) = &self.desktop_state {
+            format!("当前桌面：未知（设备回读：{}）", state.raw_value)
+        } else {
+            "当前桌面：未读取".into()
+        };
+        let mut desktop_options = div().flex().flex_wrap().gap_2();
+        for mode in DesktopMode::SELECTABLE {
+            desktop_options = desktop_options.child(
+                option_button(mode.name(), desktop_current == Some(mode), desktop_disabled)
+                    .id(("desktop-mode", mode as usize))
+                    .on_click(cx.listener(move |page, _, _, cx| {
+                        if !desktop_disabled { page.request_desktop_mode(Some(mode), cx); }
+                    })),
+            );
+        }
+        let desktop = crate::ui::navigation::emphasis_any(card_container(), cx, &["desktop"])
+            .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("显示器桌面模式"))
+            .child(div().text_xs().text_color(gpui::rgb(ThemeColors::TEXT_SECONDARY()))
+                .child("切换后显示器会打开系统桌面。办公模式包含会议投屏功能。"))
+            .child(div().text_xs().child(desktop_label))
+            .child(desktop_options)
+            .child(option_button("刷新桌面模式", false, desktop_disabled).id("refresh-desktop-mode")
+                .on_click(cx.listener(move |page, _, _, cx| {
+                    if !desktop_disabled { page.request_desktop_mode(None, cx); }
+                })))
+            .children(self.desktop_error.as_ref().map(|error| {
+                div().text_xs().text_color(gpui::rgb(ThemeColors::STATUS_ERROR())).child(error.clone())
+            }));
 
         // 1. ADB Guardian 卡片状态指示与视觉增强
         let (badge_text, badge_bg, badge_fg, guardian_detail) = match &self.guardian {
@@ -199,7 +274,7 @@ impl Render for ToolsPage {
             }
         };
 
-        let mut guardian = card_container()
+        let mut guardian = crate::ui::navigation::emphasis_any(card_container(), cx, &["guardian"])
             .child(
                 div()
                     .flex()
@@ -255,7 +330,7 @@ impl Render for ToolsPage {
         guardian = guardian.child(guardian_actions);
 
         // 2. 设备工具卡片与长错误换行展示
-        let mut device = card_container().child(
+        let mut device = crate::ui::navigation::emphasis_any(card_container(), cx, &["deploy", "resolution", "reboot"]).child(
             div()
                 .flex_shrink_0()
                 .text_base()
@@ -417,7 +492,7 @@ impl Render for ToolsPage {
                         .flex_shrink_0()
                         .gap_2()
                         .child(
-                            div()
+                            crate::ui::navigation::emphasis(div(), cx, "shell")
                                 .flex_shrink_0()
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
@@ -470,7 +545,7 @@ impl Render for ToolsPage {
                         .flex_shrink_0()
                         .gap_2()
                         .child(
-                            div()
+                            crate::ui::navigation::emphasis(div(), cx, "apk")
                                 .flex_shrink_0()
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
@@ -674,14 +749,14 @@ impl Render for ToolsPage {
             );
         }
 
-        let mut settings = card_container()
+        let settings = crate::ui::navigation::emphasis_any(card_container(), cx, &["close", "autostart", "theme"])
             .child(
                 div()
                     .flex_shrink_0()
                     .text_base()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(gpui::rgb(ThemeColors::TEXT_PRIMARY()))
-                    .child("应用偏好与扫描设置"),
+                    .child("应用偏好"),
             )
             .child(
                 div()
@@ -715,6 +790,8 @@ impl Render for ToolsPage {
                     )
                     .child(themes),
             )
+;
+        let mut scanning = crate::ui::navigation::emphasis_any(card_container(), cx, &["scan-force", "scan-block", "scan-subnet"])
             .child(
                 div()
                     .flex_shrink_0()
@@ -728,7 +805,7 @@ impl Render for ToolsPage {
             .iter()
             .enumerate()
         {
-            settings = settings.child(
+            scanning = scanning.child(
                 div()
                     .flex()
                     .flex_col()
@@ -751,7 +828,7 @@ impl Render for ToolsPage {
             );
         }
 
-        settings = settings.child(
+        scanning = scanning.child(
             div()
                 .flex()
                 .flex_shrink_0()
@@ -822,7 +899,7 @@ impl Render for ToolsPage {
             );
         }
 
-        let hdr = card_container()
+        let hdr = crate::ui::navigation::emphasis_any(card_container(), cx, &["hdr-memory"])
             .child(
                 div()
                     .flex()
@@ -947,9 +1024,9 @@ impl Render for ToolsPage {
                     .text_color(gpui::rgb(ThemeColors::TEXT_PRIMARY()))
                     .child("全局快捷键与提交控制"),
             )
-            .child(div().flex_shrink_0().child(self.hotkey_form.clone()))
+
             .child(
-                div()
+                crate::ui::navigation::emphasis(div(), cx, "countdown")
                     .flex()
                     .flex_wrap()
                     .flex_shrink_0()
@@ -1016,10 +1093,10 @@ impl Render for ToolsPage {
                                     })),
                             ),
                     ),
-            );
+            ).child(crate::ui::navigation::emphasis(div(), cx, "hotkeys").child(self.hotkey_form.clone()));
 
         // 7. 运行日志卡片
-        let logs = card_container().child(
+        let logs = crate::ui::navigation::emphasis_any(card_container(), cx, &["logs"]).child(
             div()
                 .flex()
                 .flex_shrink_0()
@@ -1084,16 +1161,18 @@ impl Render for ToolsPage {
                     .text_xl()
                     .font_weight(FontWeight::BOLD)
                     .text_color(gpui::rgb(ThemeColors::TEXT_PRIMARY()))
-                    .child("工具与设置"),
+                    .child(crate::ui::navigation::section_label(cx, crate::ui::navigation::TOOLS)),
             )
-            .child(guardian)
-            .child(device)
-            .child(extras)
-            .child(settings)
-            .child(hdr)
-            .child(keys)
-            .child(logs)
-            .child(
+            .when(self.busy || self.desktop_busy, |d| d.child(div().text_sm()
+                .text_color(gpui::rgb(ThemeColors::STATUS_WARNING())).child("设备操作进行中…")))
+            .when(section == "device", |d| d.child(desktop).child(guardian))
+            .when(section == "device" || self.confirmation.is_some(), |d| d.child(device))
+            .when(section == "debug", |d| d.child(extras).child(logs))
+            .when(section == "preferences", |d| d.child(settings))
+            .when(section == "scan", |d| d.child(scanning))
+            .when(section == "hdr", |d| d.child(hdr))
+            .when(section == "keys", |d| d.child(keys))
+            .when(section == "debug", |d| d.child(
                 option_button("第三方许可", false, false)
                     .id("third-party-notices")
                     .on_click(cx.listener(|this, _, _, _| {
@@ -1114,7 +1193,7 @@ impl Render for ToolsPage {
                             }
                         });
                     })),
-            )
+            ))
     }
 }
 pub fn render_tools_page(page: Entity<ToolsPage>) -> Div {

@@ -666,6 +666,7 @@ impl PicturePage {
 
 impl Render for PicturePage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let section = crate::ui::navigation::section(cx, crate::ui::navigation::PICTURE);
         let is_connected = self.is_connected;
         let is_fetching = self.is_fetching;
 
@@ -692,14 +693,9 @@ impl Render for PicturePage {
                             .text_xl()
                             .font_weight(gpui::FontWeight::BOLD)
                             .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
-                            .child("画面设置"),
+                            .child(crate::ui::navigation::section_label(cx, crate::ui::navigation::PICTURE)),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(ThemeColors::TEXT_SECONDARY()))
-                            .child("核心画质硬件寄存器与 Android Settings 调优"),
-                    ),
+
             )
             .child(
                 div()
@@ -748,7 +744,7 @@ impl Render for PicturePage {
             );
 
         // 1. 真实硬件场景状态卡片
-        let scene_card = card_container().child(
+        let scene_card = card_container().py_2().child(
             div()
                 .flex()
                 .flex_row()
@@ -818,35 +814,13 @@ impl Render for PicturePage {
             (9, "电影模式 (9)"),
         ];
 
-        let mode_card = card_container()
+        let mode_card = crate::ui::navigation::emphasis(card_container(), cx, "picture-mode")
             .child(
                 div()
                     .flex()
-                    .flex_row()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
-                            .child("基础画面模式预设"),
-                    )
-                    .children(if self.pending_mode.is_some() {
-                        Some(badge(
-                            "切换待确认",
-                            ThemeColors::STATUS_WARNING_BG(),
-                            ThemeColors::STATUS_WARNING(),
-                        ))
-                    } else {
-                        None
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
+                    .flex_row().flex_wrap().items_center()
                     .gap_2()
+                    .child(div().text_sm().mr_2().child("画面模式"))
                     .children(mode_buttons.into_iter().map(|(mode_val, label_str)| {
                         let is_selected = active_mode_display == Some(mode_val);
                         let is_pending_this = self.pending_mode == Some(mode_val);
@@ -889,148 +863,25 @@ impl Render for PicturePage {
         let dimming_levels = [(0, "0 关"), (1, "1 低"), (2, "2 中"), (3, "3 高")];
 
         let dimming_and_sensor_card = card_container()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
-                    .child("自动光感与 MiniLED 分区控光"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    // 自动光感行
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(gpui::FontWeight::BOLD)
-                                            .child("自动光感 (环境光自适应)"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(ThemeColors::TEXT_MUTED()))
-                                            .child(match cur_light_sensor {
-                                                Some(true) => "当前状态: 已开启",
-                                                Some(false) => "当前状态: 已关闭",
-                                                None => "当前状态: 未知",
-                                            }),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .children(if self.pending_light_sensor.is_some() {
-                                        Some(badge(
-                                            "待确认",
-                                            ThemeColors::STATUS_WARNING_BG(),
-                                            ThemeColors::STATUS_WARNING(),
-                                        ))
-                                    } else {
-                                        None
-                                    })
-                                    .child(
-                                        div()
-                                            .id("btn_picture_light_sensor")
-                                            .child(option_button(
-                                                match cur_light_sensor {
-                                                    Some(true) => "光感: 开启",
-                                                    Some(false) => "光感: 关闭",
-                                                    None => "光感: 未知 (点击切换)",
-                                                },
-                                                cur_light_sensor == Some(true),
-                                                !is_connected,
-                                            ))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                let cur = this
-                                                    .pending_light_sensor
-                                                    .or(this.confirmed_light_sensor)
-                                                    .unwrap_or(false);
-                                                this.set_light_sensor(!cur, cx);
-                                            })),
-                                    ),
-                            ),
-                    )
-                    // 精密控光 (0/1/2/3) 行
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .justify_between()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(gpui::FontWeight::BOLD)
-                                            .child("精密控光 (Local Dimming 分区背光)"),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_2()
-                                            .children(if self.pending_local_dimming.is_some() {
-                                                Some(badge(
-                                                    "控光待确认",
-                                                    ThemeColors::STATUS_WARNING_BG(),
-                                                    ThemeColors::STATUS_WARNING(),
-                                                ))
-                                            } else {
-                                                None
-                                            })
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(ThemeColors::TEXT_MUTED()))
-                                                    .child(match cur_local_dimming {
-                                                        Some(v) => format!("当前挡位: {} 档", v),
-                                                        None => "当前挡位: 未知".to_string(),
-                                                    }),
-                                            ),
-                                    ),
-                            )
-                            .child(div().flex().flex_row().gap_2().children(
-                                dimming_levels.into_iter().map(|(lvl, lvl_label)| {
-                                    let is_selected = cur_local_dimming == Some(lvl);
-                                    let is_pending_this = self.pending_local_dimming == Some(lvl);
-                                    let btn_label = if is_pending_this {
-                                        format!("{} [待确认]", lvl_label)
-                                    } else {
-                                        lvl_label.to_string()
-                                    };
-
-                                    div()
-                                        .id(("btn_picture_local_dimming", lvl as usize))
-                                        .child(option_button(btn_label, is_selected, !is_connected))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.set_local_dimming(lvl, cx);
-                                        }))
-                                }),
-                            )),
-                    ),
-            );
+            .child(crate::ui::navigation::emphasis(div(), cx, "sensor").flex().flex_wrap().items_center().justify_between().gap_2()
+                .child(div().text_sm().child("自动光感 · 环境光自适应"))
+                .child(div().flex().items_center().gap_2()
+                    .when(self.pending_light_sensor.is_some(), |d| d.child(badge("待确认", ThemeColors::STATUS_WARNING_BG(), ThemeColors::STATUS_WARNING())))
+                    .child(option_button(match cur_light_sensor { Some(true) => "光感：开启", Some(false) => "光感：关闭", None => "光感：未知" }, cur_light_sensor == Some(true), !is_connected)
+                        .id("btn_picture_light_sensor")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let current = this.pending_light_sensor.or(this.confirmed_light_sensor).unwrap_or(false);
+                            this.set_light_sensor(!current, cx);
+                        })))))
+            .child(crate::ui::navigation::emphasis(div(), cx, "dimming").flex().flex_wrap().items_center().justify_between().gap_2()
+                .child(div().text_sm().child("精密控光 · 分区背光"))
+                .child(div().flex().flex_wrap().items_center().gap_2()
+                    .when(self.pending_local_dimming.is_some(), |d| d.child(badge("待确认", ThemeColors::STATUS_WARNING_BG(), ThemeColors::STATUS_WARNING())))
+                    .children(dimming_levels.into_iter().map(|(level, label)| {
+                        option_button(label, cur_local_dimming == Some(level), !is_connected)
+                            .id(("btn_picture_local_dimming", level as usize))
+                            .on_click(cx.listener(move |this, _, _, cx| this.set_local_dimming(level, cx)))
+                    }))));
 
         // 4. 6 个核心滑块卡片 (背光 1..100, 黑色级别/对比度/饱和度/色调/锐度 0..100)
         let render_slider_row = |slider: &SliderParamState| -> Div {
@@ -1086,10 +937,10 @@ impl Render for PicturePage {
                         div()
                             .text_xs()
                             .text_color(rgb(ThemeColors::TEXT_MUTED()))
-                            .child("背光范围 1..100，其余画质参数范围 0..100"),
+                            .child("画面参数范围 0–100"),
                     ),
             )
-            .child(render_slider_row(&self.backlight))
+
             .child(render_slider_row(&self.black_level))
             .child(render_slider_row(&self.contrast))
             .child(render_slider_row(&self.saturation))
@@ -1101,13 +952,17 @@ impl Render for PicturePage {
         div()
             .flex()
             .flex_col()
-            .gap_4()
+            .gap_3()
             .child(header)
             .child(scene_card)
-            .child(mode_card)
-            .child(dimming_and_sensor_card)
-            .child(sliders_card)
-            .child(self.advanced.clone())
+            .when(self.advanced.read(cx).is_busy() || self.pending_mode.is_some() || self.pending_light_sensor.is_some()
+                || self.pending_local_dimming.is_some() || [&self.backlight, &self.black_level, &self.contrast,
+                    &self.saturation, &self.hue, &self.sharpness].iter().any(|s| s.pending.is_some()), |d|
+                d.child(badge("画面调整正在写入或等待硬件确认", ThemeColors::STATUS_WARNING_BG(), ThemeColors::STATUS_WARNING())))
+            .when(section == "mode", |d| d.child(mode_card).child(dimming_and_sensor_card)
+                .child(card_container().child(render_slider_row(&self.backlight))))
+            .when(section == "parameters", |d| d.child(sliders_card))
+            .when(section == "color" || section == "motion", |d| d.child(self.advanced.clone()))
     }
 }
 

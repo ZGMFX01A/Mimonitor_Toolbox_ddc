@@ -45,7 +45,6 @@ pub struct GamePage {
     pub params: GameParameters,
     pub confirm_dialog: Option<ConfirmDialogState>,
     pub is_refreshing: bool,
-    pub last_mode: Option<i32>,
     pub connected: bool,
     pub generation: u64,
     pub error: Option<String>,
@@ -59,7 +58,6 @@ impl GamePage {
             params: GameParameters::default(),
             confirm_dialog: None,
             is_refreshing: false,
-            last_mode: None,
             connected: false,
             generation: 0,
             error: None,
@@ -68,16 +66,12 @@ impl GamePage {
 
     /// 后台回读最新游戏参数后更新 UI 状态
     pub fn update_params(&mut self, new_params: GameParameters, cx: &mut Context<Self>) {
-        let previous_mode = self.last_mode;
-        let current_mode = new_params.picture_mode;
-        self.last_mode = current_mode;
+        let previous_game = self.params.game_mode_active();
+        let current_game = new_params.game_mode_active();
 
         // 准星游戏模式仅在游戏模式联动逻辑 (crosshair_game_mode_only)
         if self.config.crosshair_game_mode_only {
-            let was_game = previous_mode.map(is_game_picture_mode).unwrap_or(false);
-            let is_game = current_mode.map(is_game_picture_mode).unwrap_or(false);
-
-            if previous_mode.is_some() && !was_game && is_game {
+            if previous_game == Some(false) && current_game == Some(true) {
                 // 回到游戏模式：若当前准星为 0 且存在记忆，自动恢复
                 if new_params.front_sight_index == Some(0) {
                     if let Some(mem_sight) = self.config.crosshair_memory {
@@ -91,7 +85,7 @@ impl GamePage {
                         }
                     }
                 }
-            } else if current_mode.is_some() && was_game && !is_game {
+            } else if previous_game == Some(true) && current_game == Some(false) {
                 // 离开游戏模式：若当前准星非 0，自动记录并隐藏
                 let cur_sight = new_params.front_sight_index.unwrap_or(0);
                 if cur_sight != 0 {
@@ -109,6 +103,7 @@ impl GamePage {
 
         self.params = new_params;
         self.is_refreshing = false;
+        self.error = None;
         cx.notify();
     }
 
@@ -125,10 +120,7 @@ impl GamePage {
 
     /// 判断当前是否处于已确认的游戏模式
     pub fn is_game_mode_active(&self) -> bool {
-        self.params
-            .picture_mode
-            .map(is_game_picture_mode)
-            .unwrap_or(false)
+        self.params.game_mode_active() == Some(true)
     }
 
     /// 异步安全持久化当前配置
@@ -160,7 +152,6 @@ impl GamePage {
     ) {
         if !connected || self.generation != generation {
             self.params = GameParameters::default();
-            self.last_mode = None;
             self.confirm_dialog = None;
             self.error = None;
         }
@@ -605,8 +596,8 @@ fn render_option_group<T: Copy + PartialEq + 'static>(
     current_val: Option<T>,
     on_select: impl Fn(T, &mut GamePage, &mut Context<GamePage>) + 'static + Copy,
     cx: &mut Context<GamePage>,
-) -> Div {
-    div()
+) -> gpui::Stateful<Div> {
+    crate::ui::navigation::emphasis(div(), cx, title)
         .flex()
         .flex_col()
         .gap_2()
@@ -668,23 +659,30 @@ fn render_option_group<T: Copy + PartialEq + 'static>(
 
 impl Render for GamePage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_game_mode = self.is_game_mode_active();
-        let picture_mode_known = self.params.picture_mode.is_some();
-
-        // 状态提示文本与颜色 (对照 pages.py 410-412 与 display_features.py 1740-1753)
-        let (hint_text, hint_color) = if !picture_mode_known {
+        let section = crate::ui::navigation::section(cx, crate::ui::navigation::GAME);
+        let (hint_text, hint_color) = if self.params.game_mode_active().is_none() {
             (
-                "当前画面模式未知；高亮值尚未确认是否生效。",
+                "当前游戏模式状态未知；同步与刷新率按设备回读显示，瞄准辅助是否生效尚未确认。",
                 ThemeColors::STATUS_WARNING(),
             )
-        } else if is_game_mode {
+        } else if self.params.video_game_mode == Some(true) {
             (
-                "当前为游戏模式；下方高亮为当前生效值。",
+                "当前为游戏模式（设备游戏开关已开启）；各项高亮显示设备回读值。",
+                ThemeColors::STATUS_SUCCESS(),
+            )
+        } else if self.params.freesync == Some(true) {
+            (
+                "当前为游戏模式（FreeSync 已开启）；各项高亮显示设备回读值。",
+                ThemeColors::STATUS_SUCCESS(),
+            )
+        } else if self.is_game_mode_active() {
+            (
+                "当前为游戏模式；各项高亮显示设备回读值。",
                 ThemeColors::STATUS_SUCCESS(),
             )
         } else {
             (
-                "当前不是游戏模式；下方高亮为记忆值，功能当前未生效。",
+                "当前画面模式不是游戏模式；瞄准辅助仅在游戏模式下生效，同步与刷新率按设备回读显示。",
                 ThemeColors::STATUS_WARNING(),
             )
         };
@@ -757,9 +755,22 @@ impl Render for GamePage {
                                     .text_xl()
                                     .font_weight(gpui::FontWeight::BOLD)
                                     .text_color(rgb(ThemeColors::TEXT_PRIMARY()))
-                                    .child("游戏模式"),
+                                    .child(crate::ui::navigation::section_label(cx, crate::ui::navigation::GAME)),
                             )
-                            .child(div().text_xs().text_color(rgb(hint_color)).child(hint_text)),
+                            .child(div().text_xs().text_color(rgb(hint_color)).child(hint_text))
+                            .child(
+                                div().text_xs().text_color(rgb(ThemeColors::TEXT_SECONDARY()))
+                                    .child(format!(
+                                        "设备回读：游戏开关 {} · 画面模式 {} · FreeSync {}",
+                                        match self.params.video_game_mode {
+                                            Some(true) => "1（开）", Some(false) => "0（关）", None => "未读取",
+                                        },
+                                        self.params.picture_mode.map(|v| v.to_string()).unwrap_or_else(|| "未读取".into()),
+                                        match self.params.freesync {
+                                            Some(true) => "开", Some(false) => "关", None => "未读取",
+                                        },
+                                    )),
+                            ),
                     )
                     .child(
                         div()
@@ -779,7 +790,7 @@ impl Render for GamePage {
                     ),
             )
             // 卡片 1: 刷新率与同步 (FreeSync & 320Hz)
-            .child(
+            .when(section == "sync", |d| d.child(
                 card_container()
                     .child(
                         div()
@@ -857,9 +868,9 @@ impl Render for GamePage {
                         |val, page, cx| page.select_320hz(val, cx),
                         cx,
                     )),
-            )
+            ))
             // 卡片 2: 准星与狙击镜瞄准辅助
-            .child(
+            .when(section == "aim", |d| d.child(
                 card_container()
                     .child(
                         div()
@@ -937,9 +948,9 @@ impl Render for GamePage {
                         |val, page, cx| page.select_sniper_night_vision(val, cx),
                         cx,
                     )),
-            )
+            ))
             // 卡片 4: 游戏辅助工具 (FPS / 秒表 / 计时器)
-            .child(
+            .when(section == "panel", |d| d.child(
                 card_container()
                     .child(
                         div()
@@ -971,7 +982,7 @@ impl Render for GamePage {
                         |val, page, cx| page.select_timer(val, cx),
                         cx,
                     )),
-            )
+            ))
             // 应用内安全前置/模式确认弹窗浮层
             .children(self.confirm_dialog.as_ref().map(|dlg| {
                 let title = dlg.title.clone();

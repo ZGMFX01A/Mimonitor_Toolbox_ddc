@@ -511,6 +511,7 @@ impl UiChild {
 struct Snapshot {
     connection: Option<AppEvent>,
     backlight: Option<AppEvent>,
+    source: Option<AppEvent>,
     displays: Option<AppEvent>,
     monitors: Option<AppEvent>,
     activity: Option<AppEvent>,
@@ -524,6 +525,7 @@ impl Snapshot {
                         if previous == generation);
                 if !state.is_connected() || !same_session {
                     self.backlight = None;
+                    self.source = None;
                 }
                 self.connection = Some(event.clone());
             }
@@ -539,6 +541,15 @@ impl Snapshot {
                 }
             }
             AppEvent::WindowsDisplaysDiscovered(_) => self.displays = Some(event.clone()),
+            AppEvent::SourceUpdated { generation, .. }
+            | AppEvent::SourceReadFailed { generation, .. } => {
+                let connected = matches!(self.connection.as_ref(),
+                    Some(AppEvent::AdbStateChanged { state, generation: current, .. })
+                        if state.is_connected() && current == generation);
+                if connected {
+                    self.source = Some(event.clone());
+                }
+            }
             AppEvent::DdcMonitorsDiscovered(_) => self.monitors = Some(event.clone()),
             AppEvent::DeviceActivity { active, .. } => {
                 self.activity = active.then(|| event.clone());
@@ -562,6 +573,7 @@ impl Snapshot {
         self.connection
             .iter()
             .chain(self.backlight.iter())
+            .chain(self.source.iter())
             .chain(self.displays.iter())
             .chain(self.monitors.iter())
             .chain(self.activity.iter())
@@ -760,6 +772,48 @@ pub(crate) fn run_background(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_replays_source_after_connection_when_ui_reopens() {
+        let mut snapshot = Snapshot::default();
+        snapshot.record(&AppEvent::AdbStateChanged {
+            ip: "192.168.5.19".into(), state: crate::adb::AdbDeviceState::Device,
+            model: "MiTV-MFFU1".into(), generation: 4,
+        });
+        snapshot.record(&AppEvent::SourceUpdated {
+            source: Some(crate::device::source::VideoSource::Hdmi1),
+            raw_value: "23".into(), generation: 4,
+        });
+        for _ in 0..2 {
+            let events = snapshot.events();
+            assert!(matches!(events.first(), Some(AppEvent::AdbStateChanged { .. })));
+            assert!(events.iter().any(|e| matches!(e, AppEvent::SourceUpdated {
+                source: Some(crate::device::source::VideoSource::Hdmi1), generation: 4, ..
+            })), "reopened UI lost the source already read by the backend");
+        }
+        snapshot.record(&AppEvent::AdbStateChanged {
+            ip: "192.168.5.19".into(), state: crate::adb::AdbDeviceState::Offline,
+            model: String::new(), generation: 4,
+        });
+        assert!(!snapshot.events().iter().any(|e| matches!(e, AppEvent::SourceUpdated { .. })));
+        snapshot.record(&AppEvent::SourceUpdated {
+            source: Some(crate::device::source::VideoSource::Hdmi2),
+            raw_value: "24".into(), generation: 4,
+        });
+        assert!(!snapshot.events().iter().any(|e| matches!(e, AppEvent::SourceUpdated { .. })));
+        snapshot.record(&AppEvent::AdbStateChanged {
+            ip: "192.168.5.19".into(), state: crate::adb::AdbDeviceState::Device,
+            model: String::new(), generation: 5,
+        });
+        snapshot.record(&AppEvent::SourceUpdated {
+            source: Some(crate::device::source::VideoSource::Hdmi1),
+            raw_value: "23".into(), generation: 4,
+        });
+        assert!(!snapshot.events().iter().any(|e| matches!(e, AppEvent::SourceUpdated { .. })));
+        snapshot.record(&AppEvent::SourceReadFailed {
+            error: "回读失败".into(), generation: 5,
+        });
+        assert!(snapshot.events().iter().any(|e| matches!(e, AppEvent::SourceReadFailed { generation: 5, .. })));
+    }
     #[test]
     fn snapshot_replays_backlight_after_connection_when_ui_reopens() {
         let mut snapshot = Snapshot::default();

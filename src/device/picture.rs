@@ -57,7 +57,7 @@ pub fn hdr_tone_mapping_mtk_to_ui(mtk_val: i32) -> Option<u32> {
 pub fn is_game_picture_mode(mode: i32) -> bool {
     matches!(
         mode,
-        10 | 25 | 26 | 27 | 28 | 29 | 4 | 15 | 19 | 30 | 31 | 32 | 33
+        10 | 24 | 25 | 26 | 27 | 28 | 29 | 4 | 15 | 19 | 30 | 31 | 32 | 33
     )
 }
 

@@ -14,12 +14,12 @@ pub fn card_container() -> Div {
         .flex()
         .flex_col()
         .flex_shrink_0()
-        .p_4()
+        .p_3()
         .bg(rgb(ThemeColors::BG_CARD()))
         .border_1()
         .border_color(rgb(ThemeColors::BORDER()))
         .rounded_lg()
-        .gap_3()
+        .gap_2()
 }
 
 /// 构建通用静态按钮

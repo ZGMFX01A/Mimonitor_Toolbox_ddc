@@ -141,29 +141,31 @@ impl Render for HotkeyForm {
                     .child("输入组合键，例如 Ctrl+Alt+F6；留空解除绑定。保存时会检查冲突。"),
             );
 
+        let mut bindings = div().grid().grid_cols(2).gap_2().w_full();
         for (index, action) in CycleAction::ALL.into_iter().enumerate() {
-            root = root.child(
+            bindings = bindings.child(
                 div()
                     .flex()
-                    .flex_wrap()
                     .items_center()
-                    .gap_3()
+                    .min_w_0()
+                    .gap_2()
                     .child(
                         div()
-                            .w(gpui::px(160.0))
-                            .min_w(gpui::px(120.0))
-                            .text_sm()
+                            .w(gpui::px(104.0)).flex_shrink_0()
+                            .text_xs()
                             .text_color(gpui::rgb(ThemeColors::TEXT_PRIMARY()))
                             .child(action.label()),
                     )
                     .child(
                         div()
                             .flex_1()
-                            .min_w(gpui::px(180.0))
+                            .min_w_0()
                             .child(self.cycles[index].clone()),
                     ),
             );
         }
+
+        root = root.child(bindings);
 
         let expanded = self.expanded;
         let adjust_count = self.adjusts.len();

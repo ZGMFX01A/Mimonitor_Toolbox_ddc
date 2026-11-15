@@ -1,3 +1,4 @@
+pub mod desktop;
 pub mod game;
 pub mod guardian;
 pub mod jni;

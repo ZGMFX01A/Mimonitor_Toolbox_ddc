@@ -286,7 +286,7 @@ impl Render for ContinuousSlider {
             px(0.0)
         };
 
-        div()
+        crate::ui::navigation::emphasis(div(), cx, &self.label)
             .flex()
             .flex_col()
             .w_full()

@@ -46,8 +46,10 @@ impl AutoTaskPage {
 }
 impl Render for AutoTaskPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut page=div().flex().flex_col().gap_4().child(div().text_xl().child("自动任务"))
+        let section = crate::ui::navigation::section(cx, crate::ui::navigation::TASKS);
+        let mut page=div().flex().flex_col().gap_4().child(div().text_xl().child(crate::ui::navigation::section_label(cx, crate::ui::navigation::TASKS)))
             .child(div().text_sm().child("应用运行并连接显示器时生效。支持跨午夜；时段重叠时列表靠后的任务优先。结束后恢复进入任务前的设置。"));
+        let mut listing = div().flex().flex_col().gap_2();
         for (index, task) in self.config.auto_tasks.clone().into_iter().enumerate() {
             let name = self
                 .config
@@ -74,6 +76,7 @@ impl Render for AutoTaskPage {
                             option_button("编辑", false, false)
                                 .id(("task-edit", index))
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    crate::ui::navigation::select(cx, crate::ui::navigation::TASKS, "editor", None);
                                     this.editing = Some(edit.id.clone());
                                     this.preset = edit.preset_id.clone();
                                     this.start.update(cx, |input, cx| {
@@ -94,13 +97,14 @@ impl Render for AutoTaskPage {
                                 })),
                         ),
                 );
-            page = page.child(row);
+            listing = listing.child(row);
         }
         if self.config.auto_tasks.is_empty() {
-            page = page.child(
+            listing = listing.child(
                 card_container().child("尚无自动任务。先在预设页面保存一组设置，再添加时间段。"),
             );
         }
+        page = page.when(section == "list", |d| d.child(listing));
         let mut editor = card_container()
             .child(div().text_lg().child(if self.editing.is_some() {
                 "编辑时间段"
@@ -173,11 +177,12 @@ impl Render for AutoTaskPage {
                         } else {
                             this.editing = None;
                             this.error.clear();
+                            crate::ui::navigation::select(cx, crate::ui::navigation::TASKS, "list", None);
                         }
                         cx.notify();
                     })),
             );
-        page = page.child(editor);
+        page = page.when(section == "editor", |d| d.child(editor));
         if let Some(id) = self.deleting.clone() {
             page = page.child(
                 card_container()
@@ -204,10 +209,13 @@ impl Render for AutoTaskPage {
                     ),
             );
         }
+        let mut recovery_view = card_container().child(div().text_sm().child("任务运行与恢复记录"));
+        let mut has_recovery = false;
         if let Some(value) = self.config.extra.get("scheduler_recovery") {
             if let Ok(recovery) =
                 crate::presets::recovery::SchedulerRecovery::from_extra_value(value)
             {
+                has_recovery = true;
                 let status = if let Some(id) = recovery.active_task_id {
                     format!("执行中：{id}")
                 } else if recovery.waiting_task_id.is_some() {
@@ -215,10 +223,10 @@ impl Render for AutoTaskPage {
                 } else {
                     "当前无执行中的时间段".into()
                 };
-                page = page.child(div().text_sm().child(status));
+                recovery_view = recovery_view.child(div().text_sm().child(status));
                 if !recovery.blocked_task_ids.is_empty() {
-                    page =
-                        page.child(div().text_sm().child(
+                    recovery_view =
+                        recovery_view.child(div().text_sm().child(
                             "部分失败的任务已暂停。恢复原基线后，编辑并保存任务可重新启用。",
                         ));
                 }
@@ -229,7 +237,7 @@ impl Render for AutoTaskPage {
                     .enumerate()
                 {
                     let id = record.task_id.clone();
-                    page = page.child(
+                    recovery_view = recovery_view.child(
                         card_container()
                             .child(format!("待还原：{} · {}", record.task_id, record.reason))
                             .child(
@@ -244,6 +252,8 @@ impl Render for AutoTaskPage {
                 }
             }
         }
+        if !has_recovery { recovery_view = recovery_view.child("当前没有待恢复记录。"); }
+        page = page.when(section == "recovery", |d| d.child(recovery_view));
         if let Some(id) = self.restore.clone() {
             page = page.child(
                 card_container()
