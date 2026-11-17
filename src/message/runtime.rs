@@ -540,13 +540,56 @@ impl MessageBus {
     }
 }
 
-fn connection_retry_delay(error: &crate::adb::AdbError, retries: u8) -> Option<Duration> {
+const CONNECTION_RECOVERY_WINDOW: Duration = Duration::from_secs(180);
+const CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(15);
+
+fn connection_retry_delay(error: &crate::adb::AdbError) -> Option<Duration> {
     use crate::adb::AdbError::*;
-    if retries >= 6 || !matches!(error,
-        NetworkUnreachable(_) | PortClosed(_) | HandshakeFailed(_) | DeviceOffline | NotFound) {
+    // getprop failures also mean the booting device may not be ready yet.
+    if matches!(error, Unauthorized | Cancelled) {
         return None;
     }
-    Some(Duration::from_secs((2u64 << retries).min(30)))
+    Some(CONNECTION_RETRY_DELAY)
+}
+
+struct ConnectionRecovery {
+    env: Envelope,
+    deadline: Instant,
+    due: Instant,
+    error: String,
+}
+impl ConnectionRecovery {
+    fn after_failure(env: Envelope, deadline: Instant, error: &crate::adb::AdbError, now: Instant) -> Option<Self> {
+        let delay = connection_retry_delay(error)?;
+        (now < deadline).then(|| Self {
+            env, deadline, due: (now + delay).min(deadline), error: error.to_string(),
+        })
+    }
+
+    fn is_current(&self, bus: &MessageBus) -> bool {
+        self.env.dispatch_generation == bus.active_generation.load(Ordering::Acquire)
+            && !self.env.token.as_ref().unwrap().load(Ordering::Acquire)
+    }
+}
+
+fn report_connection_failure(bus: &MessageBus, env: &Envelope, error: &str, exhausted: bool) {
+    let AppCommand::ConnectAdb { ip, generation } = &env.command else { return; };
+    bus.active_generation.with_current(*generation, || {
+        if bus.is_shutdown.load(Ordering::Acquire) || env.token.as_ref().unwrap().load(Ordering::Acquire) {
+            return;
+        }
+        let message = if exhausted {
+            format!("{ip} 自动重连已持续 3 分钟仍未成功。请检查网络与显示器 ADB 调试，点击通知打开主窗口重连。最后错误：{error}")
+        } else {
+            format!("{ip} 连接失败：{error}。点击通知打开主窗口，处理后重新连接。")
+        };
+        crate::logger::log_adb(&message);
+        let _ = bus.event_sender.send(AppEvent::AdbStateChanged {
+            ip: ip.clone(), state: AdbDeviceState::Error(message.clone()),
+            model: String::new(), generation: *generation,
+        });
+        let _ = bus.event_sender.send(AppEvent::AdbConnectionWarning { message, generation: *generation });
+    });
 }
 
 fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
@@ -555,7 +598,7 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
     let mut shortcuts = super::shortcuts::Shortcuts::new();
     let mut hdr = crate::device::hdr::HdrMemory::new();
     let mut preset_sync = super::preset_sync::PresetSyncDebouncer::new();
-    let mut retry: Option<(Instant, Envelope, u8)> = None;
+    let mut retry: Option<ConnectionRecovery> = None;
     let mut session: Option<Envelope> = None;
     let mut last_health_check = Instant::now();
     let mut last_background = Instant::now();
@@ -577,8 +620,12 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
                         let _ = bus.event_sender.send(AppEvent::AdbStateChanged {
                             ip: dev.ip.clone(), state: state.clone(), model: String::new(), generation: live,
                         });
-                        if state != AdbDeviceState::Unauthorized {
-                            retry = Some((Instant::now() + Duration::from_secs(2), current.clone(), 1));
+                        if state == AdbDeviceState::Unauthorized {
+                            report_connection_failure(&bus, current, &crate::adb::AdbError::Unauthorized.to_string(), false);
+                        } else {
+                            let now = Instant::now();
+                            retry = ConnectionRecovery::after_failure(current.clone(), now + CONNECTION_RECOVERY_WINDOW,
+                                &crate::adb::AdbError::DeviceOffline, now);
                         }
                         device = None;
                         preset_sync.clear();
@@ -586,16 +633,18 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
                 }
             }
         }
-        if retry.as_ref().is_some_and(|(_, env, _)|
-            env.dispatch_generation != bus.active_generation.load(Ordering::Acquire)
-            || env.token.as_ref().unwrap().load(Ordering::Acquire)) {
+        if retry.as_ref().is_some_and(|pending| !pending.is_current(&bus)) {
             retry = None;
         }
-        let (next, retry_count) = if retry.as_ref().is_some_and(|(due, _, _)| Instant::now() >= *due) {
-            let (_, env, count) = retry.take().unwrap();
-            (Some(env), count)
+        let (next, recovery_deadline) = if retry.as_ref().is_some_and(|pending| Instant::now() >= pending.due) {
+            let pending = retry.take().unwrap();
+            if Instant::now() >= pending.deadline {
+                report_connection_failure(&bus, &pending.env, &pending.error, true);
+                continue;
+            }
+            (Some(pending.env), Some(pending.deadline))
         } else {
-            (inbox.receive_timed(), 0)
+            (inbox.receive_timed(), None)
         };
         if next.is_none() || last_background.elapsed() >= Duration::from_secs(2) {
             last_background = Instant::now();
@@ -752,9 +801,14 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
                     continue;
                 }
                 session = Some(env.clone());
+                // All attempts share one wall-clock budget, including waiting and cleanup.
+                let deadline = recovery_deadline.unwrap_or_else(|| Instant::now() + CONNECTION_RECOVERY_WINDOW);
+                if recovery_deadline.is_some() {
+                    crate::logger::log_adb(&format!("自动重连 {ip}，恢复期剩余 {} 秒", deadline.saturating_duration_since(Instant::now()).as_secs()));
+                }
                 let dev = AdbDevice::new(ip.clone()).with_session_cancel(token.clone());
                 let result =
-                    dev.connect_transaction(Duration::from_secs(12), 3, true, Some(&token));
+                    dev.connect_transaction(deadline.saturating_duration_since(Instant::now()).min(Duration::from_secs(12)), 3, true, Some(&token));
                 if *generation != bus.active_generation.load(Ordering::Acquire)
                     || token.load(Ordering::Acquire)
                 {
@@ -763,6 +817,9 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
                 }
                 match result {
                     Ok(model) => {
+                        if recovery_deadline.is_some() {
+                            crate::logger::log_adb(&format!("自动重连 {ip} 成功"));
+                        }
                         let heal = crate::device::jni::check_and_heal_jar(&dev);
                         if *generation != bus.active_generation.load(Ordering::Acquire)
                             || token.load(Ordering::Acquire)
@@ -793,16 +850,22 @@ fn adb_loop(inbox: Arc<Inbox>, bus: MessageBus) {
                     }
                     Err(error) => {
                         let _ = dev.disconnect();
-                        if let Some(delay) = connection_retry_delay(&error, retry_count) {
-                            retry = Some((Instant::now() + delay, env.clone(), retry_count + 1));
-                        }
+                        retry = ConnectionRecovery::after_failure(env.clone(), deadline, &error, Instant::now());
                         crate::logger::log_adb(&format!("连接 {ip} 失败：{error}"));
-                        let _ = bus.event_sender.send(AppEvent::AdbStateChanged {
-                            ip: ip.clone(),
-                            state: AdbDeviceState::Error(error.to_string()),
-                            model: String::new(),
-                            generation: *generation,
-                        });
+                        if let Some(pending) = retry.as_ref() {
+                            let status = if pending.due == pending.deadline {
+                                "3 分钟自动重连即将结束"
+                            } else {
+                                "15 秒后自动重试（最多持续 3 分钟）"
+                            };
+                            let _ = bus.event_sender.send(AppEvent::AdbStateChanged {
+                                ip: ip.clone(),
+                                state: AdbDeviceState::Error(format!("{error}；{status}")),
+                                model: String::new(), generation: *generation,
+                            });
+                        } else if !matches!(error, crate::adb::AdbError::Cancelled) {
+                            report_connection_failure(&bus, &env, &error.to_string(), Instant::now() >= deadline);
+                        }
                     }
                 }
             }
@@ -1417,14 +1480,65 @@ mod tests {
         ), "设备操作已完成");
     }
     #[test]
+    fn connection_recovery_waits_for_slow_startup_and_retries_server_start() {
+        use crate::adb::AdbError::*;
+        assert_eq!(connection_retry_delay(&NetworkUnreachable("wifi".into())), Some(Duration::from_secs(15)));
+        assert_eq!(connection_retry_delay(&DeviceOffline), Some(Duration::from_secs(15)));
+        assert_eq!(connection_retry_delay(&ServerNotReady("启动超时".into())), Some(Duration::from_secs(15)));
+        assert_eq!(connection_retry_delay(&CommandFailed("getprop 读取超时".into())), Some(Duration::from_secs(15)));
+    }
+
+    #[test]
     fn connection_recovery_is_bounded_and_stops_for_authorization_or_cancel() {
         use crate::adb::AdbError::*;
-        assert_eq!(connection_retry_delay(&NetworkUnreachable("wifi".into()), 0), Some(Duration::from_secs(2)));
-        assert_eq!(connection_retry_delay(&DeviceOffline, 5), Some(Duration::from_secs(30)));
-        assert_eq!(connection_retry_delay(&DeviceOffline, 6), None);
-        assert_eq!(connection_retry_delay(&Unauthorized, 0), None);
-        assert_eq!(connection_retry_delay(&Cancelled, 0), None);
-        assert_eq!(connection_retry_delay(&ServerNotReady("foreign owner".into()), 0), None);
+        assert_eq!(connection_retry_delay(&Unauthorized), None);
+        assert_eq!(connection_retry_delay(&Cancelled), None);
+        let start = Instant::now();
+        let deadline = start + CONNECTION_RECOVERY_WINDOW;
+        // Fast failures must not exhaust a retry count before a slow boot completes.
+        let env = connection_envelope();
+        for seconds in (0..180).step_by(15) {
+            let pending = ConnectionRecovery::after_failure(env.clone(), deadline, &DeviceOffline,
+                start + Duration::from_secs(seconds)).unwrap();
+            assert_eq!(pending.deadline, deadline);
+            assert!(pending.due <= deadline);
+        }
+        let pending = ConnectionRecovery::after_failure(env.clone(), deadline, &DeviceOffline,
+            deadline - Duration::from_secs(1)).unwrap();
+        assert_eq!(pending.due, deadline);
+        assert!(ConnectionRecovery::after_failure(env.clone(), deadline, &DeviceOffline, deadline).is_none());
+        assert!(ConnectionRecovery::after_failure(env, deadline, &Unauthorized, start).is_none());
+    }
+
+    fn connection_envelope() -> Envelope {
+        Envelope {
+            command: AppCommand::ConnectAdb { ip: "192.0.2.1".into(), generation: 1 },
+            token: Some(Arc::new(AtomicBool::new(false))), revision: 0, dispatch_generation: 1,
+        }
+    }
+
+    #[test]
+    fn connection_recovery_and_warnings_stop_after_cancel_or_session_change() {
+        let bus = MessageBus::remote(std::sync::mpsc::sync_channel(1).0);
+        let env = connection_envelope();
+        let now = Instant::now();
+        let pending = ConnectionRecovery::after_failure(env.clone(), now + CONNECTION_RECOVERY_WINDOW,
+            &crate::adb::AdbError::DeviceOffline, now).unwrap();
+        assert!(pending.is_current(&bus));
+        bus.active_generation.store(2, Ordering::Release);
+        assert!(!pending.is_current(&bus));
+        report_connection_failure(&bus, &env, "timeout", true);
+        assert!(bus.try_recv_event().is_none());
+        bus.active_generation.store(1, Ordering::Release);
+        env.token.as_ref().unwrap().store(true, Ordering::Release);
+        assert!(!pending.is_current(&bus));
+        report_connection_failure(&bus, &env, "cancelled", true);
+        assert!(bus.try_recv_event().is_none());
+        env.token.as_ref().unwrap().store(false, Ordering::Release);
+        report_connection_failure(&bus, &env, "timeout", true);
+        assert!(matches!(bus.try_recv_event(), Some(AppEvent::AdbStateChanged { .. })));
+        assert!(matches!(bus.try_recv_event(), Some(AppEvent::AdbConnectionWarning { generation: 1, .. })));
+        assert!(bus.try_recv_event().is_none());
     }
 
     #[test]

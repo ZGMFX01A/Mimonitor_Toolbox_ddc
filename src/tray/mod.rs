@@ -7,7 +7,8 @@ use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{RedrawWindow, RDW_FRAME, RDW_INVALIDATE, RDW_UPDATENOW};
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_WARNING,
+    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIN_BALLOONUSERCLICK, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -101,7 +102,11 @@ impl SystemTrayManager {
                 match msg {
                     WM_TRAY_CALLBACK => {
                         let event = lparam.0 as u32;
-                        if event == WM_LBUTTONUP {
+                        if event == NIN_BALLOONUSERCLICK {
+                            if let Some(ref tx) = *EVENT_SENDER.lock() {
+                                let _ = tx.send(TrayEvent::OpenMainWindow);
+                            }
+                        } else if event == WM_LBUTTONUP {
                             if let Some(ref tx) = *EVENT_SENDER.lock() {
                                 let _ = tx.send(TrayEvent::ToggleBrightnessPanel);
                             }
@@ -292,8 +297,6 @@ impl SystemTrayManager {
                 Err(_) => return,
             };
 
-            *hwnd_holder.lock() = Some(hwnd.0 as isize);
-
             // 初始化托盘图标
             let icon = app_icon();
             let mut tip = [0u16; 128];
@@ -313,6 +316,7 @@ impl SystemTrayManager {
             };
 
             let _ = Shell_NotifyIconW(NIM_ADD, &mut nid);
+            *hwnd_holder.lock() = Some(hwnd.0 as isize);
 
             // 保持 Win32 消息循环
             let mut msg = std::mem::zeroed();
@@ -343,6 +347,23 @@ impl SystemTrayManager {
         }
     }
 
+    /// Submit a native notification from the resident, without launching GPUI.
+    pub fn show_warning(&self, title: &str, message: &str) -> bool {
+        let hwnd = self.hwnd_raw.lock();
+        let Some(raw) = *hwnd else { return false; };
+        let mut nid = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: HWND(raw as *mut _),
+            uID: 1,
+            uFlags: NIF_INFO,
+            dwInfoFlags: NIIF_WARNING,
+            ..Default::default()
+        };
+        copy_notification_text(&mut nid.szInfoTitle, title);
+        copy_notification_text(&mut nid.szInfo, message);
+        unsafe { Shell_NotifyIconW(NIM_MODIFY, &mut nid).as_bool() }
+    }
+
     /// UI 线程非阻塞提取托盘消息
     pub fn try_recv_event(&self) -> Option<TrayEvent> {
         let rx = self.event_receiver.lock();
@@ -354,6 +375,62 @@ impl SystemTrayManager {
         if let Some(sender) = EVENT_SENDER.lock().as_ref() {
             let _ = sender.send(event);
         }
+    }
+}
+
+fn copy_notification_text(buffer: &mut [u16], text: &str) {
+    buffer.fill(0);
+    let mut length = 0;
+    for ch in text.chars().take_while(|&ch| ch != '\0') {
+        let mut units = [0u16; 2];
+        let encoded = ch.encode_utf16(&mut units);
+        if length + encoded.len() >= buffer.len() {
+            break;
+        }
+        buffer[length..length + encoded.len()].copy_from_slice(encoded);
+        length += encoded.len();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_text_preserves_unicode_and_terminator() {
+        let mut buffer = [0u16; 5];
+        copy_notification_text(&mut buffer, "中文😀末尾");
+        assert_eq!(String::from_utf16(&buffer[..4]).unwrap(), "中文😀");
+        assert_eq!(buffer[4], 0);
+        copy_notification_text(&mut buffer, "中😀😀");
+        assert_eq!(String::from_utf16(&buffer[..3]).unwrap(), "中😀");
+        assert_eq!(&buffer[3..], &[0, 0]);
+    }
+
+    #[test]
+    #[ignore = "requires Windows notification area and displays one test notification"]
+    fn native_warning_is_submitted_and_click_opens_main_window() {
+        use std::time::{Duration, Instant};
+        let tray = SystemTrayManager::new();
+        tray.start();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tray.hwnd_raw.lock().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(tray.show_warning("Mimonitor 通知测试", "ADB 重连告警通知验证。"));
+        let raw = tray.hwnd_raw.lock().unwrap();
+        unsafe {
+            PostMessageW(Some(HWND(raw as *mut _)), WM_TRAY_CALLBACK,
+                WPARAM(1), LPARAM(NIN_BALLOONUSERCLICK as isize)).unwrap();
+        }
+        loop {
+            if matches!(tray.try_recv_event(), Some(TrayEvent::OpenMainWindow)) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "notification click was not dispatched");
+            thread::sleep(Duration::from_millis(10));
+        }
+        tray.shutdown();
     }
 }
 

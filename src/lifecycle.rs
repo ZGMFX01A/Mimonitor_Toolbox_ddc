@@ -663,6 +663,14 @@ pub(crate) fn run_background(
                 break;
             };
             match &event {
+                AppEvent::AdbConnectionWarning { message, generation } => {
+                    bus.active_generation.with_current(*generation, || {
+                        if !bus.is_shutdown.load(Ordering::Acquire) && !tray.show_warning("ADB 连接失败", message) {
+                            crate::logger::log_adb("Windows 托盘告警提交失败");
+                        }
+                    });
+                    continue;
+                }
                 AppEvent::OpenBrightness => {
                     activate(UiAction::Brightness, &mut pending);
                     continue;

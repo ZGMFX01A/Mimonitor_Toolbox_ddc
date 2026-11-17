@@ -209,6 +209,11 @@ pub enum AppEvent {
         generation: u64,
     },
     ConfigUpdated(crate::config::AppConfig),
+    /// Resident-only warning: it must be visible even when no UI process exists.
+    AdbConnectionWarning {
+        message: String,
+        generation: u64,
+    },
     AdbStateChanged {
         ip: String,
         state: AdbDeviceState,

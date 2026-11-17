@@ -2267,7 +2267,7 @@ fn run_ui_application(
                                     }
                                     cx.notify();
                                 }
-                                AppEvent::OpenBrightness => {}
+                                AppEvent::OpenBrightness | AppEvent::AdbConnectionWarning { .. } => {}
                                 AppEvent::AdbStateChanged {
                                     ip,
                                     state,
