@@ -9,6 +9,30 @@ use gpui::{
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+#[derive(Clone, Copy)]
+struct BacklightSubmission {
+    generation: u64,
+    request_id: u64,
+    target: u32,
+}
+
+fn backlight_display_value(
+    pending: &mut Option<BacklightSubmission>,
+    generation: u64,
+    connected: bool,
+    confirmed: Option<u32>,
+    results: &std::collections::BTreeMap<u64, (u64, Option<String>)>,
+) -> Option<u32> {
+    if let Some(write) = pending {
+        if !connected || write.generation != generation
+            || results.get(&write.request_id).is_some_and(|(epoch, _)| *epoch == generation)
+        {
+            *pending = None;
+        }
+    }
+    pending.as_ref().map(|write| write.target).or(confirmed)
+}
+
 /// 多显示器统一亮度悬浮面板托盘弹窗视图 (严格零同步 IO，由全局共享 AppState 订阅驱动)
 pub struct TrayBrightnessPopupView {
     pub app_state: Entity<AppState>,
@@ -22,6 +46,7 @@ pub struct TrayBrightnessPopupView {
     pub on_open_toolbox: Option<Box<dyn Fn(&mut Window, &mut Context<Self>) + 'static>>,
     pub on_close: Option<Box<dyn Fn(&mut Window, &mut Context<Self>) + 'static>>,
     pub focus_handle: FocusHandle,
+    pending_backlight: Option<BacklightSubmission>,
 }
 
 impl TrayBrightnessPopupView {
@@ -32,19 +57,14 @@ impl TrayBrightnessPopupView {
         on_close: Option<Box<dyn Fn(&mut Window, &mut Context<Self>) + 'static>>,
     ) -> Self {
         let focus_handle = cx.focus_handle();
-        let app_state_for_slider = app_state.clone();
+        let weak_view = cx.entity().downgrade();
         let xiaomi_slider = cx.new(|_| {
             ContinuousSlider::new(
                 0,
                 true,
                 Some("ADB 离线 / 未连接".into()),
                 move |val, _, cx| {
-                    let bus = app_state_for_slider.read(cx).bus.clone();
-                    let gen = bus.active_generation.load(Ordering::Relaxed);
-                    let _ = bus.cmd_sender.send(AppCommand::SetBacklight {
-                        value: val,
-                        generation: gen,
-                    });
+                    let _ = weak_view.update(cx, |view, cx| view.on_backlight_change(val, cx));
                 },
             )
         });
@@ -66,6 +86,7 @@ impl TrayBrightnessPopupView {
             on_open_toolbox,
             on_close,
             focus_handle,
+            pending_backlight: None,
         };
 
         // 初始同步共享状态
@@ -75,6 +96,34 @@ impl TrayBrightnessPopupView {
         view.refresh_monitors(cx);
 
         view
+    }
+
+    fn on_backlight_change(&mut self, value: u32, cx: &mut Context<Self>) {
+        let state = self.app_state.read(cx);
+        if !state.adb_state.is_connected() { return; }
+        let bus = state.bus.clone();
+        let generation = bus.active_generation.load(Ordering::Acquire);
+        if self.pending_backlight.is_some_and(|write| write.generation == generation && write.target == value)
+            || (self.pending_backlight.is_none() && state.adb_backlight == Some(value)) {
+            return;
+        }
+        let request_id = crate::ddc::next_ddc_revision();
+        self.pending_backlight = Some(BacklightSubmission { generation, request_id, target: value });
+        if bus.cmd_sender.send(AppCommand::TrayValueCommit {
+            param: crate::hotkey::AdjustParam::Backlight,
+            value: value as i32,
+            generation,
+            request_id,
+        }).is_err() {
+            self.pending_backlight = None;
+            self.status_msg = Some("亮度提交失败：后台已停止".into());
+            let state = self.app_state.clone();
+            let view = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                let _ = view.update(cx, |this, cx| this.sync_from_app_state(&state, cx));
+            });
+        }
+        cx.notify();
     }
 
     /// 从共享 AppState 同步所有显示器状态与滑块
@@ -87,9 +136,19 @@ impl TrayBrightnessPopupView {
         }
         let (connected, backlight, monitors, bus) = {
             let st = state.read(cx);
+            let generation = st.bus.active_generation.load(Ordering::Acquire);
+            if let Some(write) = self.pending_backlight {
+                if let Some((epoch, error)) = st.tray_value_results.get(&write.request_id) {
+                    if *epoch == generation {
+                        self.status_msg = error.as_ref().map(|error| format!("亮度设置失败：{error}"));
+                    }
+                }
+            }
+            let backlight = backlight_display_value(&mut self.pending_backlight,
+                generation, st.adb_state.is_connected(), st.adb_backlight, &st.tray_value_results);
             (
                 st.adb_state.is_connected(),
-                st.adb_backlight,
+                backlight,
                 st.ddc_monitors.clone(),
                 st.bus.clone(),
             )
@@ -104,6 +163,7 @@ impl TrayBrightnessPopupView {
         };
 
         self.xiaomi_slider.update(cx, |s, cx| {
+            s.label = if self.pending_backlight.is_some() { "背光（设置中）" } else { "背光" }.into();
             s.set_disabled(disabled, reason, cx);
             s.set_value_opt(backlight, cx);
         });
@@ -177,6 +237,46 @@ impl TrayBrightnessPopupView {
             });
         }
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(request_id: u64, target: u32) -> Option<BacklightSubmission> {
+        Some(BacklightSubmission { generation: 1, request_id, target })
+    }
+
+    #[test]
+    fn backlight_keeps_target_during_old_reads_and_unrelated_notifications() {
+        let mut pending = write(10, 1);
+        let mut results = std::collections::BTreeMap::new();
+        assert_eq!(backlight_display_value(&mut pending, 1, true, Some(15), &results), Some(1));
+        results.insert(9, (1, None));
+        results.insert(8, (1, Some("older command failed".into())));
+        assert_eq!(backlight_display_value(&mut pending, 1, true, Some(12), &results), Some(1));
+        results.insert(10, (1, None));
+        assert_eq!(backlight_display_value(&mut pending, 1, true, Some(1), &results), Some(1));
+        assert!(pending.is_none());
+        assert_eq!(backlight_display_value(&mut pending, 1, true, Some(25), &results), Some(25));
+    }
+
+    #[test]
+    fn backlight_rolls_back_only_for_its_own_failure_or_a_session_change() {
+        let mut pending = write(11, 30);
+        let mut results = std::collections::BTreeMap::new();
+        results.insert(11, (0, Some("previous session".into())));
+        assert_eq!(backlight_display_value(&mut pending, 1, true, Some(15), &results), Some(30));
+        results.insert(11, (1, Some("write failed".into())));
+        assert_eq!(backlight_display_value(&mut pending, 1, true, Some(15), &results), Some(15));
+        assert!(pending.is_none());
+        pending = write(12, 40);
+        assert_eq!(backlight_display_value(&mut pending, 2, true, None, &results), None);
+        assert!(pending.is_none());
+        pending = write(13, 50);
+        assert_eq!(backlight_display_value(&mut pending, 1, false, None, &results), None);
+        assert!(pending.is_none());
     }
 }
 

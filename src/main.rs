@@ -2319,6 +2319,7 @@ fn run_ui_application(
                                                 },
                                             );
                                         } else {
+                                            st.adb_backlight = None;
                                             st.light_state = ScreenLightState::default();
                                         }
                                         st.picture_page.update(cx, |page, cx| {
